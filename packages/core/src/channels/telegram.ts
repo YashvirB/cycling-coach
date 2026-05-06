@@ -176,8 +176,11 @@ export function createTelegramBot(token: string, agent: CoachAgent, binary: Bina
 // MARKDOWN → TELEGRAM HTML
 // ============================================================================
 
-function markdownToTelegramHtml(md: string): string {
-  let html = md;
+export function markdownToTelegramHtml(md: string): string {
+  // Telegram has no table primitive. Extract tables first so the bullet-point
+  // regex below doesn't mangle their leading `|`, then restore as <pre> blocks.
+  const { text, tables } = extractTables(md);
+  let html = text;
 
   // Headers: ### Title → <b>Title</b>
   html = html.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
@@ -189,11 +192,12 @@ function markdownToTelegramHtml(md: string): string {
   html = html.replace(/(?<!\w)\*([^*]+?)\*(?!\w)/g, "<i>$1</i>");
   html = html.replace(/(?<!\w)_([^_]+?)_(?!\w)/g, "<i>$1</i>");
 
+  // Code blocks: ```...``` → <pre>...</pre> (must run before inline-code, otherwise the
+  // single-backtick regex eats pairs of fence backticks and breaks the block).
+  html = html.replace(/```[\w]*\n?([\s\S]*?)```/g, "<pre>$1</pre>");
+
   // Inline code: `text` → <code>text</code>
   html = html.replace(/`([^`]+?)`/g, "<code>$1</code>");
-
-  // Code blocks: ```...``` → <pre>...</pre>
-  html = html.replace(/```[\w]*\n?([\s\S]*?)```/g, "<pre>$1</pre>");
 
   // Strikethrough: ~~text~~ → <s>text</s>
   html = html.replace(/~~(.+?)~~/g, "<s>$1</s>");
@@ -205,7 +209,68 @@ function markdownToTelegramHtml(md: string): string {
   html = html.replace(/&(?!amp;|lt;|gt;)/g, "&amp;");
   html = html.replace(/<(?!\/?(?:b|i|u|s|code|pre)>)/g, "&lt;");
 
-  return html;
+  return html.replace(/\[\[__TBL_(\d+)__\]\]/g, (_, idx) => tables[Number(idx)] ?? "");
+}
+
+const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
+
+function isTableRow(line: string | undefined): boolean {
+  if (!line) return false;
+  const t = line.trim();
+  return t.startsWith("|") && t.endsWith("|") && t.length > 1;
+}
+
+function parseTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((s) => s.trim());
+}
+
+function extractTables(md: string): { text: string; tables: string[] } {
+  const lines = md.split("\n");
+  const tables: string[] = [];
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const next = lines[i + 1];
+    if (isTableRow(lines[i]) && next !== undefined && TABLE_SEPARATOR_RE.test(next)) {
+      const header = parseTableRow(lines[i]);
+      const rows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length && isTableRow(lines[j])) {
+        rows.push(parseTableRow(lines[j]));
+        j++;
+      }
+      out.push(`[[__TBL_${tables.length}__]]`);
+      tables.push(renderTableAsPre(header, rows));
+      i = j;
+    } else {
+      out.push(lines[i]);
+      i++;
+    }
+  }
+  return { text: out.join("\n"), tables };
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderTableAsPre(header: string[], rows: string[][]): string {
+  const cols = Math.max(header.length, ...rows.map((r) => r.length));
+  const widths: number[] = [];
+  for (let c = 0; c < cols; c++) {
+    let w = (header[c] ?? "").length;
+    for (const r of rows) w = Math.max(w, (r[c] ?? "").length);
+    widths.push(w);
+  }
+  const fmt = (r: string[]) =>
+    Array.from({ length: cols }, (_, c) => (r[c] ?? "").padEnd(widths[c])).join("  ").trimEnd();
+  const text = [fmt(header), ...rows.map(fmt)].map(escapeHtml).join("\n");
+  return `<pre>${text}</pre>`;
 }
 
 // ============================================================================
@@ -213,37 +278,113 @@ function markdownToTelegramHtml(md: string): string {
 // ============================================================================
 
 const TELEGRAM_MAX_LENGTH = 4096;
+const PRE_OPEN = "<pre>";
+const PRE_CLOSE = "</pre>";
+const PRE_OVERHEAD = PRE_OPEN.length + PRE_CLOSE.length;
+
+type RenderUnit = { kind: "line"; text: string } | { kind: "pre"; text: string };
+
+// Group multi-line <pre> blocks so the chunker treats each as one indivisible unit
+// (Telegram rejects chunks with unmatched <pre>/</pre>).
+function tokenizeHtml(html: string): RenderUnit[] {
+  const units: RenderUnit[] = [];
+  const lines = html.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const openIdx = line.indexOf(PRE_OPEN);
+    const closeOnSame = openIdx >= 0 ? line.indexOf(PRE_CLOSE, openIdx) : -1;
+    if (openIdx >= 0 && closeOnSame < 0) {
+      let j = i + 1;
+      while (j < lines.length && !lines[j].includes(PRE_CLOSE)) j++;
+      if (j < lines.length) {
+        units.push({ kind: "pre", text: lines.slice(i, j + 1).join("\n") });
+        i = j + 1;
+        continue;
+      }
+      // Unclosed <pre> — fall through and treat each line individually.
+    }
+    units.push({ kind: "line", text: line });
+    i++;
+  }
+  return units;
+}
+
+// Split a <pre> block whose own length exceeds maxLen into multiple wrapped <pre> chunks
+// so each chunk Telegram receives has a matching open/close tag.
+function splitPreBlock(block: string, maxLen: number): string[] {
+  const inner = block.replace(/^<pre>/, "").replace(/<\/pre>$/, "");
+  const out: string[] = [];
+  let current = "";
+  for (const row of inner.split("\n")) {
+    const candidate = current ? `${current}\n${row}` : row;
+    if (candidate.length + PRE_OVERHEAD <= maxLen) {
+      current = candidate;
+      continue;
+    }
+    if (current) {
+      out.push(`${PRE_OPEN}${current}${PRE_CLOSE}`);
+      current = row;
+      if (current.length + PRE_OVERHEAD <= maxLen) continue;
+    }
+    // Single row alone exceeds the budget — hard-split, wrap each piece.
+    const sliceMax = Math.max(1, maxLen - PRE_OVERHEAD);
+    for (let k = 0; k < row.length; k += sliceMax) {
+      out.push(`${PRE_OPEN}${row.slice(k, k + sliceMax)}${PRE_CLOSE}`);
+    }
+    current = "";
+  }
+  if (current) out.push(`${PRE_OPEN}${current}${PRE_CLOSE}`);
+  return out;
+}
+
+export function chunkHtml(html: string, maxLen: number = TELEGRAM_MAX_LENGTH): string[] {
+  if (html.length <= maxLen) return [html];
+
+  const chunks: string[] = [];
+  let current = "";
+  const flush = () => {
+    if (current) {
+      chunks.push(current);
+      current = "";
+    }
+  };
+
+  for (const unit of tokenizeHtml(html)) {
+    const text = unit.text;
+    const joinCost = current ? 1 : 0;
+
+    if (current.length + text.length + joinCost <= maxLen) {
+      current += (current ? "\n" : "") + text;
+      continue;
+    }
+
+    flush();
+
+    if (text.length <= maxLen) {
+      current = text;
+      continue;
+    }
+
+    if (unit.kind === "pre") {
+      chunks.push(...splitPreBlock(text, maxLen));
+    } else {
+      for (let i = 0; i < text.length; i += maxLen) {
+        chunks.push(text.slice(i, i + maxLen));
+      }
+    }
+  }
+
+  flush();
+  return chunks;
+}
 
 async function sendLongMessage(
   ctx: { reply: (text: string, options?: Record<string, unknown>) => Promise<unknown> },
   text: string,
 ): Promise<void> {
   const html = markdownToTelegramHtml(text);
-
-  if (html.length <= TELEGRAM_MAX_LENGTH) {
-    await ctx.reply(html, { parse_mode: "HTML" });
-    return;
-  }
-
-  // Split on paragraph boundaries, hard-split lines that exceed the limit
-  const chunks: string[] = [];
-  let current = "";
-  for (const line of html.split("\n")) {
-    if (line.length > TELEGRAM_MAX_LENGTH) {
-      if (current) { chunks.push(current); current = ""; }
-      for (let i = 0; i < line.length; i += TELEGRAM_MAX_LENGTH) {
-        chunks.push(line.slice(i, i + TELEGRAM_MAX_LENGTH));
-      }
-    } else if (current.length + line.length + 1 > TELEGRAM_MAX_LENGTH) {
-      chunks.push(current);
-      current = line;
-    } else {
-      current += (current ? "\n" : "") + line;
-    }
-  }
-  if (current) chunks.push(current);
-
-  for (const chunk of chunks) {
+  for (const chunk of chunkHtml(html)) {
     await ctx.reply(chunk, { parse_mode: "HTML" });
   }
 }
