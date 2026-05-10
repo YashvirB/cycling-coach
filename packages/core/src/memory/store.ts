@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { MemoryStore } from "../memory.js";
 import { todayInTZ } from "../agent/user-time.js";
+import { atomicWriteFileSync } from "../io/atomic-write-file-sync.js";
 
 // ============================================================================
 // MEMORY SYSTEM
@@ -10,6 +11,32 @@ import { todayInTZ } from "../agent/user-time.js";
 const SECTION_SPLIT = /(?=^## )/m;
 const markerOf = (section: string) => `## ${section}`;
 const bodyOf = (block: string) => block.slice(block.indexOf("\n") + 1);
+
+type RenameOutcome = "renamed" | "noop" | "merged";
+
+/**
+ * Apply a single section rename to `parts` IN PLACE. Shared between
+ * `renameSection` (one rename + write) and `renameSections` (chain of
+ * renames + single write); the in-place contract lets `renameSections`
+ * chain without copying the array between iterations.
+ */
+function applyRename(parts: string[], from: string, to: string): RenameOutcome {
+  const fromMarker = markerOf(from);
+  const toMarker = markerOf(to);
+  const fromIdx = parts.findIndex((p) => p.startsWith(fromMarker + "\n"));
+  if (fromIdx < 0) return "noop";
+
+  const toIdx = parts.findIndex((p) => p.startsWith(toMarker + "\n"));
+
+  if (toIdx >= 0) {
+    parts[toIdx] = `${toMarker}\n${bodyOf(parts[toIdx])}\n${bodyOf(parts[fromIdx])}`;
+    parts.splice(fromIdx, 1);
+    return "merged";
+  }
+
+  parts[fromIdx] = `${toMarker}\n${bodyOf(parts[fromIdx])}`;
+  return "renamed";
+}
 
 export class Memory implements MemoryStore {
   private memoryDir: string;
@@ -43,7 +70,7 @@ export class Memory implements MemoryStore {
     const newBlock = `${marker}\n${content}\n`;
 
     if (!existing) {
-      writeFileSync(path, newBlock, "utf-8");
+      atomicWriteFileSync(path, newBlock);
       return;
     }
 
@@ -52,10 +79,10 @@ export class Memory implements MemoryStore {
 
     if (idx >= 0) {
       parts[idx] = newBlock;
-      writeFileSync(path, parts.join(""), "utf-8");
+      atomicWriteFileSync(path, parts.join(""));
     } else {
       // Append at end (preserves legacy content not covered by any known section)
-      writeFileSync(path, existing.trimEnd() + "\n\n" + newBlock, "utf-8");
+      atomicWriteFileSync(path, existing.trimEnd() + "\n\n" + newBlock);
     }
   }
 
@@ -70,29 +97,43 @@ export class Memory implements MemoryStore {
     return body.endsWith("\n") ? body.slice(0, -1) : body;
   }
 
-  renameSection(from: string, to: string): "renamed" | "noop" | "merged" {
+  renameSection(from: string, to: string): RenameOutcome {
     const path = join(this.memoryDir, "MEMORY.md");
     const content = this.readMemory();
     if (!content) return "noop";
 
-    const fromMarker = markerOf(from);
-    const toMarker = markerOf(to);
     const parts = content.split(SECTION_SPLIT);
-    const fromIdx = parts.findIndex((p) => p.startsWith(fromMarker + "\n"));
-    if (fromIdx < 0) return "noop";
+    const outcome = applyRename(parts, from, to);
+    if (outcome === "noop") return outcome;
 
-    const toIdx = parts.findIndex((p) => p.startsWith(toMarker + "\n"));
+    atomicWriteFileSync(path, parts.join(""));
+    return outcome;
+  }
 
-    if (toIdx >= 0) {
-      parts[toIdx] = `${toMarker}\n${bodyOf(parts[toIdx])}\n${bodyOf(parts[fromIdx])}`;
-      parts.splice(fromIdx, 1);
-      writeFileSync(path, parts.join(""), "utf-8");
-      return "merged";
+  /**
+   * Apply multiple section renames as a single read + single atomic write.
+   * Used by the cycling-coach legacy migration so a partial migration cannot
+   * be observed by Reference initialization (architect-final concern 4 for
+   * Wave 1b). Returns the per-rename outcomes in the same order as `renames`.
+   */
+  renameSections(
+    renames: ReadonlyArray<readonly [string, string]>,
+  ): RenameOutcome[] {
+    const path = join(this.memoryDir, "MEMORY.md");
+    const content = this.readMemory();
+    if (!content) return renames.map(() => "noop" as const);
+
+    const parts = content.split(SECTION_SPLIT);
+    const outcomes: RenameOutcome[] = [];
+    let mutated = false;
+    for (const [from, to] of renames) {
+      const outcome = applyRename(parts, from, to);
+      outcomes.push(outcome);
+      if (outcome !== "noop") mutated = true;
     }
 
-    parts[fromIdx] = `${toMarker}\n${bodyOf(parts[fromIdx])}`;
-    writeFileSync(path, parts.join(""), "utf-8");
-    return "renamed";
+    if (mutated) atomicWriteFileSync(path, parts.join(""));
+    return outcomes;
   }
 
   /** @deprecated Use writeSection instead */
@@ -100,7 +141,7 @@ export class Memory implements MemoryStore {
     const path = join(this.memoryDir, "MEMORY.md");
     const existing = this.readMemory();
     const updated = existing ? `${existing}\n${entry}` : entry;
-    writeFileSync(path, updated, "utf-8");
+    atomicWriteFileSync(path, updated);
   }
 
   // ── Daily notes ────────────────────────────────────────────────────────
@@ -117,14 +158,14 @@ export class Memory implements MemoryStore {
     const path = join(this.memoryDir, `${d}.md`);
     const existing = this.readDailyNotes(d);
     const updated = existing ? `${existing}\n${note}` : note;
-    writeFileSync(path, updated, "utf-8");
+    atomicWriteFileSync(path, updated);
   }
 
   // ── Plans ──────────────────────────────────────────────────────────────
 
   savePlan(plan: unknown): void {
     const path = join(this.plansDir, "current-plan.json");
-    writeFileSync(path, JSON.stringify(plan, null, 2), "utf-8");
+    atomicWriteFileSync(path, JSON.stringify(plan, null, 2));
   }
 
   loadPlan(): unknown | null {

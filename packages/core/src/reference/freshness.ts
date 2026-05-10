@@ -7,8 +7,6 @@
 // ─── Freshness windows (since `last_updated` in latest.json) ───────────
 /** <24 h: data is fresh; coaching uses it without caveat. */
 export const FRESH_MS = 24 * 60 * 60 * 1000;
-/** 24-48 h: data is borderline; flag in metadata, no behavior change. */
-export const FLAG_MS = 48 * 60 * 60 * 1000;
 /** >48 h: data is stale; trigger lazy refresh in the background. */
 export const STALE_MS = 48 * 60 * 60 * 1000;
 /** >7 d: data is critical; force a fresh sync before answering. */
@@ -47,3 +45,15 @@ export const SYNC_COOLDOWN_MS = 30_000;
 export const MUTEX_HOT_WARN_MS = 10_000;
 /** Scheduled refresh cadence (in-process timer). */
 export const SCHEDULED_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+/**
+ * Per-request HTTP timeout chained with the orchestrator-level signal so a
+ * single hung endpoint cannot consume the full SYNC_OPERATION_TIMEOUT_MS
+ * budget (ADR-0011, point 2).
+ */
+export const PER_REQUEST_TIMEOUT_MS = 30_000;
+
+// ─── /snapshot raw chunked-vs-document dispatch (F5) ────────────────────
+/** If `formatSnapshotRaw` produces more chunks than this, send as a document. */
+export const SNAPSHOT_DOCUMENT_THRESHOLD_CHUNKS = 10;
+/** If the raw dump exceeds this byte budget, send as a document instead of chunked replies. */
+export const SNAPSHOT_DOCUMENT_THRESHOLD_BYTES = 65_536;
