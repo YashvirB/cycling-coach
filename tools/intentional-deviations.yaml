@@ -1,0 +1,221 @@
+# tools/intentional-deviations.yaml
+#
+# Registry of every approved deviation from section-11 (the upstream
+# Python source whose outputs are the oracle for the Reference layer's
+# metric ports). Every entry here is also discoverable via the gate
+# (`pnpm check-parity`) and the workflow driver (`/port-metric`).
+#
+# Discipline: see docs/initiatives/section-11/porting-discipline-starting-point.md
+# (gitignored, local only). A deviation may only be approved if backed
+# by peer-reviewed sports-science literature captured under
+# docs/knowledge/research/. Architect intuition is not a justification.
+#
+# Schema (v1):
+#
+#   schema_version: 1
+#   deviations:
+#     - metric: <metric_name>                      # required: snapshot key
+#       section_11_implementation: |               # required: prose description
+#         "<what section-11 does> (sync.py:<line>)"
+#       our_implementation: |                      # required: prose description
+#         "<what our TS does> (<path>:<line> or 'not yet code')"
+#       type: algorithmic | constant | branch-order | other
+#       justification:                             # required if status in
+#         kind: research_file | upstream-bug       #   (approved-cite, approved-bug);
+#         path: docs/knowledge/research/<topic>.md #   for approved-revert, the
+#         cited_papers:                            #   `notes:` block captures the
+#           - "<author year> (<short citation>)"   #   literature reviewed and the
+#           - DOI: 10.xxxx/yyyy                    #   reason for revert (no
+                                                   #   separate justification field).
+#       adr: docs/adr/<id>-<slug>.md               # optional pointer
+#       status: pending | approved-revert | approved-cite | approved-bug | rejected
+#       decided_by: <reviewer>                     # required if status != pending
+#       decided_at: <YYYY-MM-DD>                   # required if status != pending
+#       notes: |
+#         <freeform context, decision rationale, follow-ups>
+#
+# Tools that read this file:
+#   - tools/check-metric-parity.ts (the gate) — reports deviation status
+#     in pass/fail output, does not change assertion behavior (registry is
+#     informational at the gate layer; correctness is the bit-identical
+#     match against the snapshot).
+#   - .claude/skills/port-metric/SKILL.md (the workflow driver) — halts
+#     when a metric being ported has a `pending` entry; surfaces the
+#     deviation when porting against an `approved-cite` entry.
+#
+# Lifecycle: every entry starts `pending` and stays there until a human
+# review (see porting-discipline §Phase 4) records a decision. No agent
+# may flip status without an explicit human instruction citing literature
+# OR an explicit instruction to revert.
+
+schema_version: 1
+
+deviations:
+  - metric: recovery_index
+    section_11_implementation: |
+      7-day HRV / RHR baseline ratio with 2 contributors (HRV + RHR),
+      computed at sync.py:3110-3115 inside `_calculate_derived_metrics`.
+      Formula: `(latest_hrv / hrv_baseline_7d) / (latest_rhr / rhr_baseline_7d)`,
+      rounded to 2 decimals. Returns None when either baseline or
+      latest reading is missing.
+    our_implementation: |
+      Mirrors `sync.py:3110-3115` line-by-line per the T01 revert
+      decision below. Schema: `{ kind: "computed", ratio: number }` or
+      `{ kind: "unknown", reason: "no_wellness" }`. No `contributors`
+      object, no color bucket, no z-score machinery.
+
+      Historical (rejected) proposal from F8 spec rev 6: 28-day rolling
+      signed z-score over 4 contributors (sleep, rhr, hrv, soreness)
+      with weighted-worst aggregation (W = sleep:1, rhr:1, hrv:1.5,
+      soreness:0.5) and color buckets (|z| ≤ 0.5 green, ≤ 1.5 amber,
+      > 1.5 red). Rejected by the T01 review below.
+    type: algorithmic
+    status: approved-revert
+    decided_by: Yerzhan (operator)
+    decided_at: 2026-05-21
+    notes: |
+      Phase 4 (T01) decision: revert to section-11's 7-day / 2-contributor
+      implementation.
+
+      Literature reviewed (2026-05-21, agent-assisted abstract-level search):
+        - Plews 2012, "Heart rate variability in elite triathletes, is
+          variation in variability the key to effective training? A case
+          comparison" (Eur J Appl Physiol, PMID 22367011) — used 7-day
+          rolling Ln rMSSD average to detect non-functional overreaching
+          in elite triathletes. The de facto methodological standard.
+        - Buchheit 2014, "Monitoring training status with HR measures: do
+          all roads lead to Rome?" (Frontiers in Physiology,
+          DOI 10.3389/fphys.2014.00073) — recommends averaging at least
+          3-4 days; correlations with running performance only emerge
+          using ≥3-4 day averages. Consistent with 7d, not 28d.
+        - Industry convergence (Garmin, Whoop, Polar, HRV4Training): all
+          use 7-10 day baselines for endurance athletes.
+        - For the 28-day / 4-contributor / weighted-worst construction:
+          no peer-reviewed paper found supporting the specific shape.
+          Closest reference (Flatt 2018, sports/6030093) z-scored
+          subjective wellness against individual distributions but
+          analyzed each metric independently — no composite, no
+          weighted-worst aggregation, no rolling 28d baseline.
+
+      Follow-ups tracked in docs/progress/progress.json wave-2 (F8 spec
+      rev 7 inline rewrite + ADR-0015 amendment). Status lives there;
+      this entry remains anchored to the 2026-05-21 revert decision.
+
+  - metric: stress_tolerance
+    section_11_implementation: |
+      `round((strain / monotony) / 100, 1)` at sync.py:3131. Since
+      `strain = tss_7d_total × monotony` (sync.py:3087), this simplifies
+      algebraically to `tss_7d_total / 100` when monotony is non-zero.
+      Returns None when strain or monotony is missing.
+    our_implementation: |
+      Mirrors `sync.py:3131` line-by-line per the T01 revert decision
+      below. Schema: `{ kind: "computed", value: number }` or
+      `{ kind: "unknown", reason: "insufficient_data" }`. Cascades
+      Unknown from monotony.
+
+      Historical (rejected) proposal from F8 spec rev 6: capacity-cap
+      family — ratio of recent load to peak-chronic-load (max of
+      rolling-4w means inside a lookback window), with band enum
+      `["under", "healthy", "over"]` and audit fields
+      (peakChronicWeekIndex, windowDays, lookbackWeeks). ADR-0015 framed
+      this as a project-original construction. ADR-0015 is now
+      `Status: Superseded` after the T01 revert.
+    type: algorithmic
+    status: approved-revert
+    decided_by: Yerzhan (operator)
+    decided_at: 2026-05-21
+    adr: docs/adr/0015-stress-tolerance-capacity-cap-family.md
+    notes: |
+      Phase 4 (T01) decision: revert to section-11's
+      `(strain / monotony) / 100` implementation.
+
+      Literature reviewed (2026-05-21, agent-assisted abstract-level search):
+        - Foster 2001, "A new approach to monitoring exercise training"
+          (J Strength Cond Res 15(1):109–115) — establishes monotony,
+          strain, and the broader load-monitoring framework. Section-11's
+          formula reduces to a Foster-grounded weekly-load tolerance
+          scaled by 100.
+        - Busso 2003, "Variable Dose-Response Relationship between
+          Exercise Training and Performance" (Med Sci Sports Exerc
+          35(7):1188–1195) — nonlinear fitness-fatigue (IRM) model.
+          Sophisticated pharmacodynamic-style construction; NOT a
+          capacity-cap. Cannot justify recentLoad/peakChronicLoad.
+        - Banister 1975 fitness-fatigue lineage — convolution model
+          with τ time constants; not a peak-chronic-cap denominator.
+        - ACWR family (Gabbett 2016, Hulin 2016, Impellizzeri 2020) —
+          uses acute/chronic ratios but with rolling-mean denominators,
+          not peak-chronic maxima.
+        - General load-management consensus ("consistently maintained
+          chronic loads enhance tolerance") is supported, but the
+          specific peak-chronic-cap shape has no peer-reviewed source.
+
+      ADR-0015 captures the architect-intuition rationale for the
+      capacity-cap family. Per the porting discipline, architect
+      intuition is not standing for a sports-science deviation; the
+      construction is reverted absent literature.
+
+      Follow-ups tracked in docs/progress/progress.json wave-2 (F8 spec
+      rev 7 inline rewrite + ADR-0015 amendment). Status lives there;
+      this entry remains anchored to the 2026-05-21 revert decision.
+
+  - metric: load_recovery_ratio
+    section_11_implementation: |
+      `round(tss_7d_total / (ri * 100), 1) if ri and ri > 0 else None`
+      at sync.py:3135. The denominator is the recovery_index (HRV/RHR
+      autonomic-nervous-system ratio) scaled by 100. Inherits dependency
+      on the recovery_index metric.
+    our_implementation: |
+      Mirrors `sync.py:3135` line-by-line per the T01 revert decision
+      below. Schema: `{ kind: "computed", ratio: number }` or
+      `{ kind: "unknown", reason: "no_wellness" }`. Cascades Unknown
+      from recovery_index — both metrics derive from the same HRV/RHR
+      autonomic signal.
+
+      Historical (rejected) proposal from F8 spec rev 6: time-proxy
+      denominator `ratio = weeklyLoad / weeklyRecoveryProxyHours`,
+      where `weeklyRecoveryProxyHours = z1Hours + restDayCount × 8`
+      (8-hour rest-day constant flagged TENTATIVE). Bands enum
+      `["under", "healthy", "over"]`. Rejected by the T01 review below;
+      the `weeklyRecoveryProxyHours` rename of `WeeklyRollup` is also
+      dropped from rev 7 (the proxy field is no longer constructed).
+    type: algorithmic
+    status: approved-revert
+    decided_by: Yerzhan (operator)
+    decided_at: 2026-05-21
+    notes: |
+      Phase 4 (T01) decision: revert to section-11's
+      `tss_7d / (ri × 100)` implementation.
+
+      Literature reviewed (2026-05-21, agent-assisted abstract-level search):
+        - HRV/RHR as recovery indicators: Buchheit 2014
+          (DOI 10.3389/fphys.2014.00073), Plews 2012/2013, narrative
+          reviews (PMC7663087, PMC12787763). All converge on HRV being
+          a primary autonomic recovery marker for endurance athletes.
+          Section-11's denominator inherits this support indirectly.
+        - Saw 2016, "Monitoring the athlete training response: subjective
+          self-reported measures trump commonly used objective measures"
+          (Br J Sports Med 50:281–291, PMID 26423706) — caveats HRV's
+          primacy; subjective wellness outperforms objective markers.
+          Not a justification for the Z1-time deviation, just context.
+        - Z1 as a recovery DENOMINATOR (the F8 spec's choice): searched
+          polarized-training literature (Seiler 2010, recent reviews on
+          intensity distribution), HRV-guided training corpus, recovery
+          monitoring papers. Z1's role in adaptation is well-established
+          (polarized 75/5/20 pyramidal); as a recovery-dose denominator
+          specifically, NO peer-reviewed source found.
+        - The 8-hour rest-day constant in the proxy has no literature
+          anchor; F8 spec itself marks it TENTATIVE.
+
+      Asymmetric resolution under the discipline rule: deviations from
+      section-11 require literature. Section-11's HRV/RHR denominator
+      has indirect support; the Z1-time denominator has none. Revert.
+
+      Internal-coherence dividend: with recovery_index also reverted to
+      section-11's 7d/2-contributor `ri`, the `tss_7d / (ri × 100)`
+      formula becomes self-consistent — both metrics now derive from the
+      same HRV/RHR autonomic signal.
+
+      Follow-ups tracked in docs/progress/progress.json wave-2 (F8 spec
+      rev 7 inline rewrite + F7 schema rev to drop weeklyRecoveryProxyHours
+      rename + REST_DAY_RECOVERY_HOURS removal). Status lives there;
+      this entry remains anchored to the 2026-05-21 revert decision.
