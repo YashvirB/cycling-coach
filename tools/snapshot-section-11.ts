@@ -7,14 +7,11 @@
  * The Python at upstream is the source of truth; we capture its
  * outputs here so future TS metric ports have something to assert
  * against. No parity assertions ship from this script — those
- * come later, per F8+.
+ * are the gate's job.
  *
  * Offline-mode choice: Option A (stub `requests` + monkey-patch
  * `IntervalsSync._intervals_get`). See tools/snapshot-section-11.README.md
  * for rationale and trade-offs.
- *
- * GPL discipline: this script reads only the section-11 (MIT)
- * source tree. It does not touch GC.
  */
 
 import { execSync } from "node:child_process";
@@ -24,6 +21,8 @@ import { fileURLToPath } from "node:url";
 
 import { loadPyodide } from "pyodide";
 
+import type { Manifest, Snapshot } from "./check-metric-parity";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
 const PYODIDE_INDEX = resolve(REPO_ROOT, "node_modules/pyodide");
@@ -32,7 +31,7 @@ const SECTION_11_REPO =
   process.env.SECTION_11_REPO ?? resolve(REPO_ROOT, "../section-11");
 const SYNC_PY_PATH = join(SECTION_11_REPO, "examples/sync.py");
 
-const FIXTURE_REL = "packages/core/tests/fixtures/golden/realistic-athlete.json";
+const DEFAULT_FIXTURE_REL = "packages/core/tests/fixtures/golden/realistic-athlete.json";
 const ATHLETE_SLUG = "realistic-athlete";
 const SNAPSHOT_ROOT_REL = "packages/core/tests/fixtures/snapshots";
 
@@ -45,17 +44,6 @@ const SNAPSHOT_ROOT_REL = "packages/core/tests/fixtures/snapshots";
 // README.
 const FROZEN_NOW = "2026-05-10T12:00:00";
 
-interface Manifest {
-  section_11_sha: string;
-  section_11_protocol_version: string;
-  capture_date_utc: string;
-  fixtures: string[];
-  metrics: string[];
-  pyodide_version: string;
-  frozen_now: string;
-  offline_mode: "A_stub_requests_plus_monkey_patch";
-}
-
 function readPyodideVersion(): string {
   const pkg = JSON.parse(
     readFileSync(join(PYODIDE_INDEX, "package.json"), "utf8"),
@@ -65,6 +53,16 @@ function readPyodideVersion(): string {
 
 function readSection11Sha(): string {
   return execSync("git rev-parse HEAD", {
+    cwd: SECTION_11_REPO,
+    encoding: "utf8",
+  }).trim();
+}
+
+function readSection11CommitDate(sha: string): string {
+  // ISO 8601 UTC, derived from section-11's commit object — deterministic
+  // for a given SHA, replaces the old wall-clock `capture_date_utc` which
+  // broke `pnpm snapshot:section-11` byte-identity across consecutive runs.
+  return execSync(`git show -s --format=%cI ${sha}`, {
     cwd: SECTION_11_REPO,
     encoding: "utf8",
   }).trim();
@@ -81,9 +79,7 @@ function readSyncPyVersion(syncPySource: string): string {
 }
 
 function ensureDir(path: string): void {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
-  }
+  mkdirSync(path, { recursive: true });
 }
 
 const HARNESS_PROLOGUE = `
@@ -152,8 +148,65 @@ _sync_ns = {"__name__": "section_11_sync_under_test", "__file__": SYNC_PY_PATH}
 exec(SYNC_PY_SOURCE, _sync_ns)
 IntervalsSync = _sync_ns["IntervalsSync"]
 
+# === fixture contract validation ===
+# sync.py reads fixture fields almost exclusively via dict.get(),
+# which silently returns None on a missing key. A typo'd field
+# ("activitiez") would produce a wrong-because-input-was-malformed
+# snapshot, and we'd faithfully bit-port the wrong oracle. The
+# TrackedDict wraps every dict that ultimately came from FIXTURE
+# and logs every .get() of a key that was never present. After
+# sync.py finishes computing, the harness checks _TRACKED_MISSING
+# (minus the allowlist below) and fails loud if anything remains.
+#
+# Scope of tracking: only data that came from FIXTURE (the loaded
+# JSON). The positional args we hand to _calculate_derived_metrics
+# (power_model={}, race_calendar=None, etc.) are intentional empty
+# placeholders and remain untracked — they're documented in the
+# README's "Known gaps" section, not contract violations.
+#
+# Allowlist patterns use [*] as wildcard for any array index. The
+# entries below are intervals.icu fields that may legitimately be
+# absent on a per-record basis (older activities computed before
+# the field existed, rest-day wellness entries with no Fitness/Fatigue
+# scores, etc.) — they are part of the intervals.icu schema's optionality,
+# not contract violations. Extending the list requires a README
+# update in the "Contract validation" section.
+import re as _re
+_TRACKED_MISSING = []
+
+_ALLOWED_OPTIONAL_PATHS = {
+    "FIXTURE.activities[*].icu_hr_decoupling",
+    "FIXTURE.activities[*].icu_hr_zone_times",
+    "FIXTURE.activities[*].icu_hrr",
+    "FIXTURE.activities[*].icu_variability_index",
+    "FIXTURE.wellness[*].atl",
+    "FIXTURE.wellness[*].ctl",
+}
+
+def _normalize_path(path):
+    return _re.sub(r"\\[\\d+\\]", "[*]", path)
+
+class _TrackedDict(dict):
+    def __init__(self, data, path):
+        super().__init__()
+        self._path = path
+        for k, v in data.items():
+            super().__setitem__(k, _wrap_tracked(v, f"{path}.{k}"))
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        _TRACKED_MISSING.append(f"{self._path}.{key}")
+        return default
+
+def _wrap_tracked(value, path):
+    if isinstance(value, dict):
+        return _TrackedDict(value, path)
+    if isinstance(value, list):
+        return [_wrap_tracked(item, f"{path}[{i}]") for i, item in enumerate(value)]
+    return value
+
 # === fixture slicing ===
-FIXTURE = json.loads(FIXTURE_JSON)
+FIXTURE = _TrackedDict(json.loads(FIXTURE_JSON), "FIXTURE")
 _activities_all = FIXTURE.get("activities", [])
 _wellness_all = FIXTURE.get("wellness", [])
 
@@ -241,14 +294,46 @@ except Exception as e:
         }
     }
 
+if "__error__" not in derived:
+    _unallowed = sorted({
+        p for p in _TRACKED_MISSING
+        if _normalize_path(p) not in _ALLOWED_OPTIONAL_PATHS
+    })
+    if _unallowed:
+        derived = {
+            "__contract_violation__": {
+                "missing_keys": _unallowed,
+                "total_accesses": len(_TRACKED_MISSING),
+                "message": (
+                    "sync.py read None silently from fixture paths that don't exist. "
+                    "Either fix the fixture to include the keys, or — if a key is "
+                    "intentionally optional in the schema — extend the contract "
+                    "allowlist in tools/snapshot-section-11.ts. See the README's "
+                    "'Contract validation' section."
+                ),
+            }
+        }
+
 OUTPUT_JSON = json.dumps(derived, default=str, sort_keys=True)
 `;
 
 async function main(): Promise<void> {
-  const fixturePath = resolve(REPO_ROOT, FIXTURE_REL);
+  // `SNAPSHOT_FIXTURE_PATH` overrides the input fixture path —
+  // used by the contract-validation test to point at deliberately
+  // corrupted fixtures without disturbing the committed golden one.
+  // Defaults to the canonical realistic-athlete fixture.
+  const fixturePath = process.env.SNAPSHOT_FIXTURE_PATH
+    ? resolve(process.env.SNAPSHOT_FIXTURE_PATH)
+    : resolve(REPO_ROOT, DEFAULT_FIXTURE_REL);
+  // `SNAPSHOT_OUT_DIR` overrides the snapshot output root — used by the
+  // determinism test to write to temp dirs instead of clobbering the
+  // committed snapshots. Defaults to the canonical SNAPSHOT_ROOT_REL.
+  const snapshotRoot = process.env.SNAPSHOT_OUT_DIR
+    ? resolve(process.env.SNAPSHOT_OUT_DIR)
+    : resolve(REPO_ROOT, SNAPSHOT_ROOT_REL);
   const snapshotDirRel = join(SNAPSHOT_ROOT_REL, ATHLETE_SLUG);
-  const snapshotDir = resolve(REPO_ROOT, snapshotDirRel);
-  const manifestPath = resolve(REPO_ROOT, SNAPSHOT_ROOT_REL, "manifest.json");
+  const snapshotDir = join(snapshotRoot, ATHLETE_SLUG);
+  const manifestPath = join(snapshotRoot, "manifest.json");
 
   if (!existsSync(SYNC_PY_PATH)) {
     throw new Error(
@@ -264,6 +349,7 @@ async function main(): Promise<void> {
   const syncPySource = readFileSync(SYNC_PY_PATH, "utf8");
   const fixtureJson = readFileSync(fixturePath, "utf8");
   const sha = readSection11Sha();
+  const commitDate = readSection11CommitDate(sha);
   const protocolVersion = readSyncPyVersion(syncPySource);
   const pyodideVersion = readPyodideVersion();
 
@@ -295,6 +381,21 @@ async function main(): Promise<void> {
     );
   }
 
+  if ("__contract_violation__" in derived) {
+    const violation = derived.__contract_violation__ as {
+      missing_keys: string[];
+      total_accesses: number;
+      message: string;
+    };
+    const lines = violation.missing_keys.map((k) => `  - ${k}`).join("\n");
+    throw new Error(
+      `fixture/sync.py contract violation: ${violation.missing_keys.length} ` +
+        `unique missing key(s) read silently as None ` +
+        `(${violation.total_accesses} total .get() accesses):\n${lines}\n\n` +
+        violation.message,
+    );
+  }
+
   ensureDir(snapshotDir);
 
   const metrics: string[] = [];
@@ -307,7 +408,7 @@ async function main(): Promise<void> {
       section_11_protocol_version: protocolVersion,
       frozen_now: FROZEN_NOW,
       value,
-    };
+    } satisfies Snapshot;
     writeFileSync(filePath, `${JSON.stringify(wrapper, null, 2)}\n`);
     metrics.push(name);
   }
@@ -316,7 +417,7 @@ async function main(): Promise<void> {
   const manifest: Manifest = {
     section_11_sha: sha,
     section_11_protocol_version: protocolVersion,
-    capture_date_utc: new Date().toISOString(),
+    section_11_commit_date: commitDate,
     fixtures: [ATHLETE_SLUG],
     metrics,
     pyodide_version: pyodideVersion,
