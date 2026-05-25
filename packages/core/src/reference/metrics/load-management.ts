@@ -5,7 +5,7 @@
  * upstream protocol. See `NOTICE.md` for license attribution.
  */
 
-import type { Activity } from "../schemas/inputs.js";
+import type { Activity, WellnessDay } from "../schemas/inputs.js";
 
 import { getActivities, type MetricInput } from "./metric-input.js";
 
@@ -205,6 +205,285 @@ export function computeEffectiveMonotony(input: MetricInput): number | null {
   return isMultiSport && primarySportMonotony !== null
     ? primarySportMonotony
     : monotony;
+}
+
+/**
+ * Training strain (Foster 1998).
+ *
+ * Strain = weekly Load × total monotony, where weekly Load is the sum of
+ * the trailing 7-day daily-Load series (the aggregator ACWR and monotony
+ * share) and monotony is the already-rounded total monotony. Foster
+ * associates strain above ~3500-4000 with overtraining.
+ *
+ * Returns `null` whenever monotony is falsy — `null` (the empty/rest-week
+ * cascade) or `0`. This mirrors the upstream `if monotony else None`
+ * guard, so an Unknown monotony cascades to an Unknown strain.
+ *
+ * Otherwise returns `round(weeklyLoad × monotony, 0)` with half-to-even
+ * rounding to mirror Python's `round()` bit-identically.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:3087`
+ * (`_calculate_derived_metrics`). `tss_7d_total` is the sum of the 7-day
+ * series from the daily aggregator at `sync.py:3629-3644`, shared with
+ * ACWR and monotony. See `NOTICE.md` for upstream attribution.
+ *
+ * Return shape is the raw upstream output (number or null), not a
+ * discriminated-union envelope. Raw compute functions feed the parity
+ * gate; a sibling envelope wrapper will feed the curator when the
+ * curator integration lands.
+ *
+ * @see Foster, C. (1998). Monitoring training in athletes with reference
+ *      to overtraining syndrome. Med Sci Sports Exerc 30(7):1164-1168.
+ *      DOI: 10.1097/00005768-199807000-00023
+ */
+export function computeStrain(input: MetricInput): number | null {
+  const monotony = computeMonotony(input);
+  if (!monotony) return null;
+
+  const activities = getActivities(input);
+  const dailyLoad7d = getDailyLoad(activities, 7, input.frozenNow);
+  const load7dTotal = dailyLoad7d.reduce((s, t) => s + t, 0);
+
+  return roundHalfEven(load7dTotal * monotony, 0);
+}
+
+/**
+ * Stress tolerance — strain normalised by monotony, scaled to a 0-100
+ * reference band.
+ *
+ *   stressTolerance = (strain / monotony) / 100
+ *
+ * Both inputs are the already-rounded total-monotony quantities the
+ * strain metric uses: `strain` is `round(weeklyLoad × monotony, 0)` and
+ * `monotony` is `round(mean / stdev, 2)`. Because `strain` carries the
+ * `monotony` factor, the ratio collapses to roughly `weeklyLoad / 100`,
+ * but the upstream computes it from the two rounded locals — so the
+ * port does too, rather than short-cutting to weekly Load. The result
+ * is rounded half-to-even to 1 decimal.
+ *
+ * Returns `null` whenever `strain` or `monotony` is falsy (`null` from
+ * the empty/rest-week cascade, or `0`), mirroring the upstream
+ * `if strain and monotony else None` guard — so an Unknown monotony
+ * cascades through Unknown strain to an Unknown stress tolerance.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:3131`
+ * (`_calculate_derived_metrics`). `strain` and `monotony` are the locals
+ * at `sync.py:3087` and `sync.py:3037`, both built from the daily
+ * aggregator at `sync.py:3629-3644` shared with ACWR. See `NOTICE.md`
+ * for upstream attribution.
+ *
+ * Mirrors `sync.py:3131` line-by-line per the deviation registry's
+ * `stress_tolerance` `approved-revert` entry in
+ * `tools/intentional-deviations.yaml` (the capacity-cap family proposed
+ * in an earlier spec revision was reviewed and reverted; ADR-0015 is
+ * superseded).
+ *
+ * Return shape is the raw upstream output (number or null), not a
+ * discriminated-union envelope. Raw compute functions feed the parity
+ * gate; a sibling envelope wrapper will feed the curator when the
+ * curator integration lands.
+ */
+export function computeStressTolerance(input: MetricInput): number | null {
+  const strain = computeStrain(input);
+  const monotony = computeMonotony(input);
+  if (!strain || !monotony) return null;
+
+  return roundHalfEven(strain / monotony / 100, 1);
+}
+
+/**
+ * Monotony interpretation band — the human-readable verdict on monotony,
+ * multi-sport aware.
+ *
+ * Reads the three already-computed monotony quantities — total monotony,
+ * effective monotony (the selector that prefers primary-sport monotony
+ * when multi-sport is detected), and the multi-sport flag (more than one
+ * sport family in the trailing 7-day window). The band is driven by
+ * effective monotony against a single threshold of 2.0:
+ *
+ *   - effective monotony Unknown ⇒ Unknown (cascades from monotony),
+ *   - multi-sport inflation (multi-sport AND total monotony truthy AND
+ *     effective < total) ⇒ an annotated string naming both values, with
+ *     "elevated"/"normal" chosen by effective > 2.0,
+ *   - otherwise ⇒ the bare "elevated"/"normal", chosen by effective > 2.0.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:3473-3491`
+ * (`_interpret_monotony`). The three inputs are the call-site locals at
+ * `sync.py:3362-3363` — `monotony` (computeMonotony), `effective_monotony`
+ * (computeEffectiveMonotony), and `is_multi_sport`
+ * (`len(daily_tss_by_sport) > 1`, sync.py:3081). See `NOTICE.md` for
+ * upstream attribution.
+ *
+ * Return shape is the raw upstream output (string or null), not a
+ * discriminated-union envelope. Raw compute functions feed the parity
+ * gate; a sibling envelope wrapper will feed the curator when the
+ * curator integration lands.
+ *
+ * @see Foster, C. (1998). Monitoring training in athletes with reference
+ *      to overtraining syndrome. Med Sci Sports Exerc 30(7):1164-1168.
+ *      DOI: 10.1097/00005768-199807000-00023
+ */
+export function computeMonotonyInterpretation(input: MetricInput): string | null {
+  const totalMonotony = computeMonotony(input);
+  const effectiveMonotony = computeEffectiveMonotony(input);
+
+  const activities = getActivities(input);
+  const isMultiSport = getDailyLoadBySport(activities, 7, input.frozenNow).size > 1;
+
+  if (effectiveMonotony === null) return null;
+  if (isMultiSport && totalMonotony && effectiveMonotony < totalMonotony) {
+    if (effectiveMonotony > 2.0) {
+      return `elevated (primary sport ${pyFloatStr(effectiveMonotony)}, total ${pyFloatStr(totalMonotony)} inflated by multi-sport)`;
+    }
+    return `normal (primary sport ${pyFloatStr(effectiveMonotony)}, total ${pyFloatStr(totalMonotony)} inflated by multi-sport)`;
+  }
+  if (effectiveMonotony > 2.0) return "elevated";
+  return "normal";
+}
+
+/**
+ * Recovery index — the morning HRV/RHR readiness ratio.
+ *
+ * Reads the trailing 7-day wellness window (today and the six prior
+ * calendar days, in fixture order) and forms a two-contributor ratio:
+ * the day's HRV relative to its 7-day baseline, divided by the day's
+ * resting HR relative to its 7-day baseline. Above 1.0 reads as good
+ * recovery, below 1.0 as suppressed.
+ *
+ *   ri = (latestHrv / hrvBaseline7d) / (latestRhr / rhrBaseline7d)
+ *
+ * Baselines are the mean of the in-window readings, rounded to 1
+ * decimal: HRV readings filtered to the physiological band (10-250ms
+ * RMSSD, sensor-error rejection), resting-HR readings filtered to
+ * truthy values. "Latest" is the last reading in the window (HRV gated
+ * by the same validity band, resting HR taken raw). Returns `null` when
+ * any of the two latest readings or two baselines is missing or zero,
+ * mirroring the upstream truthiness guard — so an empty or wellness-free
+ * window cascades to Unknown.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:3089-3115`
+ * (`_calculate_derived_metrics`) — the 7-day baseline block plus the
+ * recovery-index ratio — and the validity band at `sync.py:6225-6231`
+ * (`_is_valid_hrv`). The 7-day window matches the harness call-site slice
+ * (`wellness_7d`); see `NOTICE.md` for upstream attribution.
+ *
+ * Two-contributor, 7-day-baseline shape per the deviation registry's
+ * `recovery_index` `approved-revert` entry in
+ * `tools/intentional-deviations.yaml` (the 28-day / 4-contributor
+ * z-score variant was reviewed and rejected for lack of literature).
+ *
+ * Return shape is the raw upstream output (number or null), not a
+ * discriminated-union envelope. Raw compute functions feed the parity
+ * gate; a sibling envelope wrapper will feed the curator when the
+ * curator integration lands.
+ */
+export function computeRecoveryIndex(input: MetricInput): number | null {
+  const wellness7d = getWellnessWindow(input, 7);
+
+  const hrvValues7d = wellness7d
+    .map((w) => w.hrv)
+    .filter((v): v is number => isValidHrv(v));
+  const rhrValues7d = wellness7d
+    .map((w) => w.restingHR)
+    .filter((v): v is number => !!v);
+
+  const hrvBaseline7d =
+    hrvValues7d.length > 0 ? roundHalfEven(arithmeticMean(hrvValues7d), 1) : null;
+  const rhrBaseline7d =
+    rhrValues7d.length > 0 ? roundHalfEven(arithmeticMean(rhrValues7d), 1) : null;
+
+  const latest = wellness7d.length > 0 ? wellness7d[wellness7d.length - 1]! : null;
+  const latestHrvRaw = latest ? latest.hrv : null;
+  const latestHrv = isValidHrv(latestHrvRaw) ? latestHrvRaw : null;
+  const latestRhr = latest ? latest.restingHR : null;
+
+  if (latestHrv && latestRhr && hrvBaseline7d && rhrBaseline7d) {
+    const hrvRatio = latestHrv / hrvBaseline7d;
+    const rhrRatio = latestRhr / rhrBaseline7d;
+    return rhrRatio > 0 ? roundHalfEven(hrvRatio / rhrRatio, 2) : null;
+  }
+  return null;
+}
+
+/**
+ * Load-recovery ratio — weekly Load weighed against autonomic recovery.
+ *
+ *   loadRecoveryRatio = weeklyLoad / (recoveryIndex × 100)
+ *
+ * The numerator is the sum of the trailing 7-day daily-Load series (the
+ * aggregator ACWR, monotony, and strain share). The denominator is the
+ * recovery index — the morning HRV/RHR readiness ratio — scaled by 100,
+ * so a healthier autonomic signal shrinks the ratio. The result is
+ * rounded half-to-even to 1 decimal.
+ *
+ * Returns `null` whenever the recovery index is falsy (`null` from the
+ * empty/wellness-free cascade, or `0`) or non-positive, mirroring the
+ * upstream `if ri and ri > 0 else None` guard — so an Unknown recovery
+ * index cascades to an Unknown load-recovery ratio.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:3135`
+ * (`_calculate_derived_metrics`). `tss_7d_total` is the sum of the 7-day
+ * series from the daily aggregator at `sync.py:3629-3644`, shared with
+ * ACWR; `ri` is the recovery-index local at `sync.py:3113`. See
+ * `NOTICE.md` for upstream attribution.
+ *
+ * Mirrors `sync.py:3135` line-by-line per the deviation registry's
+ * `load_recovery_ratio` `approved-revert` entry in
+ * `tools/intentional-deviations.yaml` (the time-proxy-denominator family
+ * proposed in an earlier spec revision was reviewed and reverted for lack
+ * of literature).
+ *
+ * Return shape is the raw upstream output (number or null), not a
+ * discriminated-union envelope. Raw compute functions feed the parity
+ * gate; a sibling envelope wrapper will feed the curator when the
+ * curator integration lands.
+ */
+export function computeLoadRecoveryRatio(input: MetricInput): number | null {
+  const ri = computeRecoveryIndex(input);
+  if (!ri || ri <= 0) return null;
+
+  const activities = getActivities(input);
+  const dailyLoad7d = getDailyLoad(activities, 7, input.frozenNow);
+  const load7dTotal = dailyLoad7d.reduce((s, t) => s + t, 0);
+
+  return roundHalfEven(load7dTotal / (ri * 100), 1);
+}
+
+// Mirrors `_is_valid_hrv` at sync.py:6225-6231: rejects null and
+// out-of-band readings (valid RMSSD is 10-250ms), filtering sensor
+// errors while preserving legitimate elite-athlete highs.
+function isValidHrv(value: number | null | undefined): value is number {
+  return value !== null && value !== undefined && value >= 10 && value <= 250;
+}
+
+// The 7-day wellness window the upstream reads as `wellness_7d`: rows
+// whose `id` date falls in [frozenNow-(days-1), frozenNow], inclusive,
+// in fixture order. Mirrors the harness `_within(_wellness_all, "id",
+// ...)` slice — the inclusive lexicographic date comparison and the
+// preserved input order matter, because the recovery index reads the
+// LAST row of this list (`wellness_7d[-1]`), not the chronologically
+// latest. Fixtures are trusted at the gate boundary (Zod ran upstream
+// of snapshot capture), matching the `getActivities` cast.
+function getWellnessWindow(input: MetricInput, days: number): WellnessDay[] {
+  const fixture = input.fixture as { wellness?: WellnessDay[] };
+  const wellness = fixture.wellness ?? [];
+  const oldest = isoDateDaysBefore(input.frozenNow, days - 1);
+  const today = input.frozenNow.slice(0, 10);
+  return wellness.filter((w) => {
+    if (typeof w.id !== "string") return false;
+    const d = w.id.slice(0, 10);
+    return oldest <= d && d <= today;
+  });
+}
+
+// Python's f-string interpolates a float via str(), which renders an
+// integer-valued float with a trailing ".0" (str(2.0) == "2.0"); JS
+// String(2.0) drops it ("2"). The monotony inputs here are round(_, 2)
+// floats, so the only divergence from shortest-round-trip repr — shared
+// by both runtimes — is that integer case. Reproduce Python's rendering
+// so an integer-valued monotony interpolates bit-identically.
+function pyFloatStr(value: number): string {
+  return Number.isInteger(value) ? `${value}.0` : `${value}`;
 }
 
 // Mirrors `SPORT_FAMILIES` at sync.py:290-308. Unmapped types fall

@@ -12,8 +12,13 @@ import type { MetricInput } from "./metric-input.js";
 import {
   computeAcwr,
   computeEffectiveMonotony,
+  computeLoadRecoveryRatio,
   computeMonotony,
+  computeMonotonyInterpretation,
   computePrimarySportMonotony,
+  computeRecoveryIndex,
+  computeStrain,
+  computeStressTolerance,
 } from "./load-management.js";
 
 export interface MetricRegistryEntry {
@@ -25,4 +30,9 @@ export const METRIC_REGISTRY: Record<string, MetricRegistryEntry> = {
   monotony: { compute: computeMonotony },
   primary_sport_monotony: { compute: computePrimarySportMonotony },
   effective_monotony: { compute: computeEffectiveMonotony },
+  monotony_interpretation: { compute: computeMonotonyInterpretation },
+  strain: { compute: computeStrain },
+  recovery_index: { compute: computeRecoveryIndex },
+  stress_tolerance: { compute: computeStressTolerance },
+  load_recovery_ratio: { compute: computeLoadRecoveryRatio },
 };
