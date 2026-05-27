@@ -8,6 +8,9 @@
 import type { Activity, WellnessDay } from "../schemas/inputs.js";
 
 import { getActivities, type MetricInput } from "./metric-input.js";
+import { roundHalfEven } from "./rounding.js";
+import { SPORT_FAMILIES } from "./sport-families.js";
+import { mean, pythonSum, sampleStdev } from "./statistics.js";
 
 /**
  * Acute:Chronic Workload Ratio (Gabbett 2016).
@@ -41,8 +44,8 @@ export function computeAcwr(input: MetricInput): number | null {
   const dailyLoad7d = getDailyLoad(activities, 7, input.frozenNow);
   const dailyLoad28d = getDailyLoad(activities, 28, input.frozenNow);
 
-  const load7dTotal = dailyLoad7d.reduce((s, t) => s + t, 0);
-  const load28dTotal = dailyLoad28d.reduce((s, t) => s + t, 0);
+  const load7dTotal = pythonSum(dailyLoad7d);
+  const load28dTotal = pythonSum(dailyLoad28d);
 
   const acuteLoad = load7dTotal ? load7dTotal / 7 : 0;
   const chronicLoad = load28dTotal ? load28dTotal / 28 : 0;
@@ -90,8 +93,8 @@ export function computeMonotony(input: MetricInput): number | null {
     return null;
   }
 
-  const meanLoad = arithmeticMean(dailyLoad7d);
-  const stdevLoad = sampleStdev(dailyLoad7d, meanLoad);
+  const meanLoad = mean(dailyLoad7d);
+  const stdevLoad = sampleStdev(dailyLoad7d);
   if (stdevLoad <= 0) return null;
 
   return roundHalfEven(meanLoad / stdevLoad, 2);
@@ -145,8 +148,7 @@ export function computePrimarySportMonotony(input: MetricInput): number | null {
   let primaryDays: number[] | undefined;
   let maxTotal = -Infinity;
   for (const days of dailyLoadBySport.values()) {
-    let total = 0;
-    for (const d of days) total += d;
+    const total = pythonSum(days);
     if (total > maxTotal) {
       maxTotal = total;
       primaryDays = days;
@@ -158,8 +160,8 @@ export function computePrimarySportMonotony(input: MetricInput): number | null {
   for (const d of primaryDays) if (d > 0) activeDays += 1;
   if (activeDays < 3 || primaryDays.length <= 1) return null;
 
-  const meanLoad = arithmeticMean(primaryDays);
-  const stdevLoad = sampleStdev(primaryDays, meanLoad);
+  const meanLoad = mean(primaryDays);
+  const stdevLoad = sampleStdev(primaryDays);
   if (stdevLoad <= 0) return null;
 
   return roundHalfEven(meanLoad / stdevLoad, 2);
@@ -242,7 +244,7 @@ export function computeStrain(input: MetricInput): number | null {
 
   const activities = getActivities(input);
   const dailyLoad7d = getDailyLoad(activities, 7, input.frozenNow);
-  const load7dTotal = dailyLoad7d.reduce((s, t) => s + t, 0);
+  const load7dTotal = pythonSum(dailyLoad7d);
 
   return roundHalfEven(load7dTotal * monotony, 0);
 }
@@ -388,9 +390,9 @@ export function computeRecoveryIndex(input: MetricInput): number | null {
     .filter((v): v is number => !!v);
 
   const hrvBaseline7d =
-    hrvValues7d.length > 0 ? roundHalfEven(arithmeticMean(hrvValues7d), 1) : null;
+    hrvValues7d.length > 0 ? roundHalfEven(mean(hrvValues7d), 1) : null;
   const rhrBaseline7d =
-    rhrValues7d.length > 0 ? roundHalfEven(arithmeticMean(rhrValues7d), 1) : null;
+    rhrValues7d.length > 0 ? roundHalfEven(mean(rhrValues7d), 1) : null;
 
   const latest = wellness7d.length > 0 ? wellness7d[wellness7d.length - 1]! : null;
   const latestHrvRaw = latest ? latest.hrv : null;
@@ -444,7 +446,7 @@ export function computeLoadRecoveryRatio(input: MetricInput): number | null {
 
   const activities = getActivities(input);
   const dailyLoad7d = getDailyLoad(activities, 7, input.frozenNow);
-  const load7dTotal = dailyLoad7d.reduce((s, t) => s + t, 0);
+  const load7dTotal = pythonSum(dailyLoad7d);
 
   return roundHalfEven(load7dTotal / (ri * 100), 1);
 }
@@ -486,56 +488,6 @@ function pyFloatStr(value: number): string {
   return Number.isInteger(value) ? `${value}.0` : `${value}`;
 }
 
-// Mirrors `SPORT_FAMILIES` at sync.py:290-308. Unmapped types fall
-// through to "other" at the lookup site.
-const SPORT_FAMILIES: Record<string, string> = {
-  Ride: "cycling",
-  VirtualRide: "cycling",
-  MountainBikeRide: "cycling",
-  GravelRide: "cycling",
-  EBikeRide: "cycling",
-  VirtualSki: "ski",
-  NordicSki: "ski",
-  Walk: "walk",
-  Hike: "walk",
-  Run: "run",
-  VirtualRun: "run",
-  TrailRun: "run",
-  Swim: "swim",
-  Rowing: "rowing",
-  WeightTraining: "strength",
-  Yoga: "other",
-  Workout: "other",
-};
-
-function arithmeticMean(values: number[]): number {
-  let total = 0;
-  for (const v of values) total += v;
-  return total / values.length;
-}
-
-// Python's `statistics.stdev` uses Fraction-exact internal arithmetic
-// (`statistics._sum`); the TS port cannot reproduce that in pure float.
-// This two-pass Neumaier-style correction
-// (`sum((x-c)^2) - sum(x-c)^2/n`) is the closest float-only
-// approximation. Bit-identity to Python holds empirically on captured
-// fixtures because the final `roundHalfEven(_, 2)` masks sub-0.005
-// drift. A future fixture whose unrounded mean/stdev lands near a
-// rounding boundary may surface as a gate failure — treat as a real
-// divergence to triage, not as proof of algorithm equivalence.
-function sampleStdev(values: number[], xbar: number): number {
-  const n = values.length;
-  let total = 0;
-  let total2 = 0;
-  for (const x of values) {
-    const d = x - xbar;
-    total += d * d;
-    total2 += d;
-  }
-  const ss = total - (total2 * total2) / n;
-  return Math.sqrt(ss / (n - 1));
-}
-
 function getDailyLoad(
   activities: Activity[],
   days: number,
@@ -543,7 +495,16 @@ function getDailyLoad(
 ): number[] {
   const dailyLoad = new Map<string, number>();
   for (const act of activities) {
-    const dateStr = act.start_date_local.slice(0, 10);
+    // The load aggregators run over raw, unwindowed activities, so a
+    // non-string start_date_local reaches here (the distribution path is
+    // pre-filtered by getActivitiesInWindow and never sees one). The oracle's
+    // window filter drops such rows; bucketing them under "" is equivalent —
+    // the result array only ever reads real dates — and avoids throwing on
+    // malformed fixture input. Mirrors the guard in selectPrimarySport.
+    const dateStr =
+      typeof act.start_date_local === "string" ? act.start_date_local.slice(0, 10) : "";
+    // `|| 0` maps a hypothetical NaN load to 0; the upstream `or 0` keeps NaN.
+    // Unreachable: z.number() rejects NaN at the schema boundary.
     const load = act.icu_training_load || 0;
     dailyLoad.set(dateStr, (dailyLoad.get(dateStr) ?? 0) + load);
   }
@@ -572,9 +533,14 @@ function getDailyLoadBySport(
 
   const bySport = new Map<string, Map<string, number>>();
   for (const act of activities) {
+    // `|| 0` maps a hypothetical NaN load to 0 (skipped); the upstream `or 0`
+    // keeps NaN. Unreachable: z.number() rejects NaN at the schema boundary.
     const load = act.icu_training_load || 0;
     if (load <= 0) continue;
-    const dateStr = act.start_date_local.slice(0, 10);
+    // Guarded like getDailyLoad: a non-string date buckets to "", which is
+    // never a window date, so the row is dropped — matching the oracle.
+    const dateStr =
+      typeof act.start_date_local === "string" ? act.start_date_local.slice(0, 10) : "";
     if (!windowDates.has(dateStr)) continue;
     // Object.hasOwn guards against prototype-chain lookups: a fixture
     // with act.type === "toString" / "constructor" / "__proto__" would
@@ -609,19 +575,4 @@ function isoDateDaysBefore(isoNow: string, daysBefore: number): string {
   const utc = new Date(Date.UTC(y, m - 1, d));
   utc.setUTCDate(utc.getUTCDate() - daysBefore);
   return utc.toISOString().slice(0, 10);
-}
-
-// Python's `round(x, n)` uses banker's rounding (round-half-to-even) and
-// diverges from `Math.round(x*10**n)/10**n` (round-half-up) for values
-// exactly at the half boundary. Mirroring Python keeps the gate
-// bit-identical on any future ACWR value that lands at the boundary.
-function roundHalfEven(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  const scaled = value * factor;
-  const floor = Math.floor(scaled);
-  const diff = scaled - floor;
-  const epsilon = 1e-9;
-  if (diff < 0.5 - epsilon) return floor / factor;
-  if (diff > 0.5 + epsilon) return (floor + 1) / factor;
-  return (floor % 2 === 0 ? floor : floor + 1) / factor;
 }
