@@ -19,6 +19,7 @@ import {
   getCurrentFtpOutdoor,
   getFtpHistoryIndoor,
   getFtpHistoryOutdoor,
+  getIntervalsLookup,
   getPastEvents,
   type MetricInput,
 } from "./metric-input.js";
@@ -319,6 +320,46 @@ export function computeBenchmarkIndoor(input: MetricInput): BenchmarkEmission {
         : formatBenchmarkPercentage(benchmarkIndex),
     seasonal_expected: seasonalExpected,
   };
+}
+
+/**
+ * Per-activity v3.106 has-intervals emission. Each entry is `true` only when
+ * the activity's lookup entry exists AND carries at least one segment with
+ * `type === "WORK"`. RECOVERY-only placeholders, empty interval lists,
+ * activities absent from the lookup, and lookup entries missing the
+ * `intervals` key all return `false`. v3.105 flagged any non-empty intervals
+ * list as structured; the v3.106 fix narrows to WORK segments so
+ * intervals.icu's whole-session RECOVERY placeholder on unstructured
+ * endurance rides no longer misclassifies them.
+ *
+ * Keys are stringified `activity.id` (mirroring `str(act.get("id"))` at
+ * `sync.py:7870`) and sorted ascending as strings to lock JSON key-order
+ * across Pyodide / CPython / Node.
+ *
+ * Upstream source mirrored line-by-line: `sync.py:7866-7873` inside
+ * `_format_activities`; v3.106 changelog entry at `sync.py:133` documents
+ * the regression fix. This Reference-port hoists the predicate into a
+ * standalone derived map so the parity gate can assert it without
+ * exposing the whole formatted-activity dict.
+ */
+export function computeHasIntervals(
+  input: MetricInput,
+): Record<string, boolean> {
+  const intervalsLookup = getIntervalsLookup(input);
+  const activities = getActivities(input);
+
+  const flagByActivityId: Record<string, boolean> = {};
+  for (const activity of activities) {
+    const key = String(activity.id);
+    const segments = intervalsLookup[key]?.intervals ?? [];
+    flagByActivityId[key] = segments.some((s) => s.type === "WORK");
+  }
+
+  const sorted: Record<string, boolean> = {};
+  for (const key of Object.keys(flagByActivityId).sort()) {
+    sorted[key] = flagByActivityId[key]!;
+  }
+  return sorted;
 }
 
 /**
