@@ -2,6 +2,7 @@ import type {
   Activity,
   FixtureShape,
   PlannedEvent,
+  WellnessDay,
 } from "../schemas/inputs.js";
 
 /** Per-activity intervals entry projected to the fields the Reference layer
@@ -64,4 +65,16 @@ export function getFtpHistoryOutdoor(
 // IntervalsEntry surface; the schema already validates the shape.
 export function getIntervalsLookup(input: MetricInput): IntervalsLookup {
   return (input.fixture.intervals ?? {}) as IntervalsLookup;
+}
+
+/** Trailing-28d wellness rows in fixture order. Weight-signal callers
+ *  filter by date internally — no slicing happens here. */
+export function getWellnessExtendedWeight(input: MetricInput): WellnessDay[] {
+  return input.fixture.wellness;
+}
+
+// Top-level eFTP fallback for `_build_weight_signal`'s FTP source
+// resolution when tested outdoor FTP is null. See FixtureSchema.eftp.
+export function getEftp(input: MetricInput): number | null {
+  return input.fixture.eftp ?? null;
 }
