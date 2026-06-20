@@ -110,5 +110,8 @@ async function fetchOnce(
     intervals: { by_activity: {} },
     routes: { routes: [] },
     ftp_history: { entries: [] },
+    ...(live.fetchErrors && live.fetchErrors.length > 0
+      ? { fetch_errors: live.fetchErrors }
+      : {}),
   };
 }

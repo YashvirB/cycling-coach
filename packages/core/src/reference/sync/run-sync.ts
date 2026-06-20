@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { ZodTypeAny } from "zod";
 import {
   MUTEX_ACQUIRE_TIMEOUT_MS,
   MUTEX_HOT_WARN_MS,
@@ -6,11 +7,12 @@ import {
   SYNC_OPERATION_TIMEOUT_MS,
 } from "../freshness.js";
 import { atomicWriteJson } from "../../io/atomic-write-json.js";
-import { LATEST_SCHEMA_VERSION } from "../schemas/latest.js";
-import { HISTORY_SCHEMA_VERSION } from "../schemas/history.js";
-import { INTERVALS_SCHEMA_VERSION } from "../schemas/intervals.js";
-import { ROUTES_SCHEMA_VERSION } from "../schemas/routes.js";
-import { FTP_HISTORY_SCHEMA_VERSION } from "../schemas/ftp-history.js";
+import { safeReadJson } from "../../io/safe-read-json.js";
+import { LATEST_SCHEMA_VERSION, LatestJsonSchema } from "../schemas/latest.js";
+import { HISTORY_SCHEMA_VERSION, HistoryJsonSchema } from "../schemas/history.js";
+import { INTERVALS_SCHEMA_VERSION, IntervalsJsonSchema } from "../schemas/intervals.js";
+import { ROUTES_SCHEMA_VERSION, RoutesJsonSchema } from "../schemas/routes.js";
+import { FTP_HISTORY_SCHEMA_VERSION, FtpHistoryJsonSchema } from "../schemas/ftp-history.js";
 import { SCHEDULER_SCHEMA_VERSION } from "../schemas/scheduler.js";
 import type { ErrorPhase, ErrorCaller } from "../schemas/error-state.js";
 import { gateLatestJson } from "../validation/sync-gate.js";
@@ -96,6 +98,12 @@ export interface FetchedReference {
   };
   readonly routes: { readonly routes: readonly unknown[] };
   readonly ftp_history: { readonly entries: readonly unknown[] };
+  /** Source endpoints that errored during the fetch (athlete-profile, wellness).
+   *  Present + non-empty means a fetch failed and was filled with empty data;
+   *  step0 hard-fails on it so the swallowed failure can no longer commit empties
+   *  behind a fresh stamp. Omitted when every endpoint was reachable, so a
+   *  fully-successful fetch is shape-identical to a genuinely-empty account. */
+  readonly fetch_errors?: readonly { readonly endpoint: string; readonly detail: string }[];
 }
 
 export interface RunSyncDeps {
@@ -137,6 +145,62 @@ interface CacheWriteSpec {
 
 /** Shared between runtime + tests so the warn-after-timeout string stays in sync. */
 export const BODY_AFTER_TIMEOUT_LOG_PREFIX = "Reference: body threw after outer timeout";
+
+/** Per-cache-file Zod schema, so the prior-read routes through the same
+ *  `safeReadJson` boundary every other Reference read uses (CONTEXT.md: Reference
+ *  NEVER calls `JSON.parse(readFileSync(...))` directly). A schema mismatch or an
+ *  unreadable file yields `null` — which `readPriorCache` already treats as "no
+ *  comparable prior, must write". */
+const CACHE_SCHEMAS: Readonly<Record<CacheFile, ZodTypeAny>> = {
+  latest: LatestJsonSchema,
+  history: HistoryJsonSchema,
+  intervals: IntervalsJsonSchema,
+  routes: RoutesJsonSchema,
+  ftp_history: FtpHistoryJsonSchema,
+};
+
+/** Read a prior on-disk cache file as a parsed object, or `null` when it is
+ *  absent / unreadable / schema-invalid — any of which means "no comparable
+ *  prior, must write". */
+function readPriorCache(path: string, file: CacheFile): Record<string, unknown> | null {
+  return safeReadJson<Record<string, unknown>>(path, CACHE_SCHEMAS[file]);
+}
+
+/** Recursively rebuild an object/array with every object's keys in sorted
+ *  order, so two structurally-equal payloads serialize identically regardless
+ *  of key insertion order. `priorPayloadEquals` reads the prior payload back
+ *  through a Zod re-parse, which rebuilds objects in schema-declaration order
+ *  rather than the producer's insertion order; canonicalizing both sides makes
+ *  the no-op short-circuit immune to that reordering (and to any future
+ *  producer that emits the same data in a different key order). */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** True when the prior file's payload (everything except the churning
+ *  `metadata` envelope) is structurally equal to the new payload — so a no-op
+ *  cycle skips the write and leaves the file byte-identical. The comparison is
+ *  key-order-insensitive (see `canonicalize`): the no-op guarantee must not
+ *  hinge on the producer emitting keys in the same order the cache schema
+ *  declares them. */
+function priorPayloadEquals(
+  prior: Record<string, unknown>,
+  payload: Readonly<Record<string, unknown>>,
+): boolean {
+  const { metadata: _metadata, ...priorPayload } = prior;
+  return (
+    JSON.stringify(canonicalize(priorPayload)) ===
+    JSON.stringify(canonicalize(payload))
+  );
+}
 
 export function createRunSync(
   deps: RunSyncDeps,
@@ -246,14 +310,28 @@ export function createRunSync(
               payload: fetched.ftp_history,
             },
           ];
-          await Promise.all(
-            cacheWrites.map(({ file, version, payload, extras }) =>
-              writeJson(join(deps.dataDir, `${file}.json`), {
-                metadata: { schema_version: version, last_updated: lastUpdated, ...extras },
-                ...payload,
+          // Content-hash short-circuit: re-stamping `last_updated` every cycle
+          // makes each cache file byte-different even when the underlying data
+          // is unchanged. The `metadata` envelope (which carries the churning
+          // `last_updated`) is excluded from the comparison so a no-op cycle
+          // leaves the file — old timestamp and all — byte-identical, and only
+          // a genuine data change rewrites the file with a fresh stamp.
+          const refreshed = (
+            await Promise.all(
+              cacheWrites.map(async ({ file, version, payload, extras }) => {
+                const path = join(deps.dataDir, `${file}.json`);
+                const prior = readPriorCache(path, file);
+                if (prior !== null && priorPayloadEquals(prior, payload)) {
+                  return null;
+                }
+                await writeJson(path, {
+                  metadata: { schema_version: version, last_updated: lastUpdated, ...extras },
+                  ...payload,
+                });
+                return file;
               }),
-            ),
-          );
+            )
+          ).filter((f): f is CacheFile => f !== null);
           // A1 fix: if the outer timeout fired during the cache writes,
           // bail before writing the commit marker. Without this guard the
           // scheduler.json could land after error_state.json was written,
@@ -286,7 +364,7 @@ export function createRunSync(
           return {
             kind: "ran",
             lastSyncAt: lastUpdated,
-            refreshed: cacheWrites.map((w) => w.file),
+            refreshed,
           };
         };
 
