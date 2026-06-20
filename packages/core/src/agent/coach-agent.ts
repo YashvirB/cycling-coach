@@ -44,6 +44,17 @@ const MAX_RATE_LIMIT_ATTEMPTS = 3;
 const MAX_SERVER_ERROR_ATTEMPTS = 2;
 const SERVER_ERROR_BACKOFF_BASE_MS = 500;
 const SERVER_ERROR_BACKOFF_MAX_MS = 5_000;
+
+// The AI-SDK path exposes Retry-After via APICallError response headers
+// (extractRetryAfterMs). Codex-normalized ServerError/RateLimitError instead
+// carry the parsed hint as a numeric `retryAfterMs` property, so honor that too;
+// otherwise the bridge parses a header the retry loop never reads.
+function retryAfterFloorMs(err: unknown): number | null {
+  const fromHeaders = extractRetryAfterMs(err);
+  if (fromHeaders !== null) return fromHeaders;
+  const carried = (err as { retryAfterMs?: unknown }).retryAfterMs;
+  return typeof carried === "number" && Number.isFinite(carried) && carried > 0 ? carried : null;
+}
 const RATE_LIMIT_FALLBACK_BASE_MS = 5_000;
 const RATE_LIMIT_FALLBACK_MULTIPLIER = 2;
 const RATE_LIMIT_FALLBACK_MAX_MS = 30_000;
@@ -53,6 +64,25 @@ const MAX_FLUSH_ATTEMPTS = 2;
 // Calendar write tools whose committed success makes a turn non-replayable.
 // Kept here so the taint set can't drift from the actual tool names.
 const WRITE_TOOL_NAMES = new Set(["intervals_create_workout", "intervals_delete_workout"]);
+
+const DISK_FULL_NOTE =
+  "\n\n(Heads up: my disk is full, so I couldn't save this to our history — but your message went through. Please free up some space when you can.)";
+
+// Disk-full is a host condition, not a per-chat one, so the athlete is told
+// once for the whole process rather than every turn the disk stays full.
+let persistenceNoticeShown = false;
+
+function noteForPersistenceFailure(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code !== "ENOSPC") return "";
+  if (persistenceNoticeShown) return "";
+  persistenceNoticeShown = true;
+  return DISK_FULL_NOTE;
+}
+
+export function __resetPersistenceNoticeState(): void {
+  persistenceNoticeShown = false;
+}
 
 type MemoryFlushTrigger =
   | "stale-reset"
@@ -85,6 +115,22 @@ function classifyError(err: unknown): string {
   if (isTimeoutError(err)) return "timeout";
   if (isRateLimitError(err)) return "rate_limit";
   return "unknown";
+}
+
+// Replays a pre-captured error to retryWithBackoff exactly once so it performs a
+// single capped backoff sleep: the first invocation rethrows `err`, the second
+// resolves. All scheduling (jitter, retry-after floor, onRetry) stays in opts.
+function backoffWithSentinelError(
+  err: unknown,
+  opts: Parameters<typeof retryWithBackoff>[1],
+): Promise<void> {
+  let retried = false;
+  return retryWithBackoff(async () => {
+    if (!retried) {
+      retried = true;
+      throw err;
+    }
+  }, opts);
 }
 
 // ============================================================================
@@ -439,14 +485,23 @@ export class CoachAgent {
             }));
             const assembledHash = computeAssembledHash(this.systemPrompt, messages);
 
-            // Append BOTH after success — JSONL unchanged on failure
-            this.chatStore.appendMessage(chatId, "user", userMessage);
-            this.chatStore.appendMessage(chatId, "assistant", text, {
-              templateHash,
-              assembledHash,
-              provider: this.config.llm.provider,
-              model: this.config.llm.model,
-            });
+            // Append BOTH after success as one atomic write — JSONL unchanged
+            // on failure, no dangling user line on a partial write.
+            let persistenceNote = "";
+            try {
+              this.chatStore.appendTurn(chatId, userMessage, text, {
+                templateHash,
+                assembledHash,
+                provider: this.config.llm.provider,
+                model: this.config.llm.model,
+              });
+            } catch (persistErr) {
+              // Deliver-first: a full disk or permission error must never
+              // discard a reply the athlete already paid for. Swallow the
+              // persistence throw, warn once, and still return the reply.
+              console.warn("Session persistence failed; delivering reply unsaved", persistErr);
+              persistenceNote = noteForPersistenceFailure(persistErr);
+            }
 
             // A turn can run several generations (retry/compaction/overflow
             // recovery); these usage/cost figures are the FINAL successful
@@ -474,7 +529,7 @@ export class CoachAgent {
               compactions,
             });
 
-            return text;
+            return text + persistenceNote;
           } catch (err) {
             // The classified budget error is terminal: re-throw it before any
             // retry branch so a future reordering can never mistake it for one of
@@ -555,7 +610,7 @@ export class CoachAgent {
               // The server hint (if any) is a lower bound; absent one, fall back to a
               // capped exponential. Either feeds the primitive as the Retry-After
               // floor so the 120s ceiling and the clamp note are honored bit-for-bit.
-              const requestedMs = extractRetryAfterMs(err)
+              const requestedMs = retryAfterFloorMs(err)
                 ?? Math.min(
                      RATE_LIMIT_FALLBACK_BASE_MS * RATE_LIMIT_FALLBACK_MULTIPLIER ** (attemptNo - 1),
                      RATE_LIMIT_FALLBACK_MAX_MS,
@@ -563,26 +618,17 @@ export class CoachAgent {
               const clampNote = requestedMs > RATE_LIMIT_MAX_WAIT_MS
                 ? ` (provider requested ${requestedMs}ms, clamped to ${RATE_LIMIT_MAX_WAIT_MS}ms)`
                 : "";
-              let retried = false;
-              await retryWithBackoff(
-                async () => {
-                  if (!retried) {
-                    retried = true;
-                    throw err;
-                  }
+              await backoffWithSentinelError(err, {
+                attempts: 2,
+                baseMs: requestedMs,
+                capMs: RATE_LIMIT_MAX_WAIT_MS,
+                shouldRetry: () => true,
+                retryAfterMs: () => requestedMs,
+                random: () => 0,
+                onRetry: ({ delayMs }) => {
+                  console.warn(`Rate limited (attempt ${attemptNo}/${MAX_RATE_LIMIT_ATTEMPTS}), waiting ${delayMs}ms${clampNote}`);
                 },
-                {
-                  attempts: 2,
-                  baseMs: requestedMs,
-                  capMs: RATE_LIMIT_MAX_WAIT_MS,
-                  shouldRetry: () => true,
-                  retryAfterMs: () => requestedMs,
-                  random: () => 0,
-                  onRetry: ({ delayMs }) => {
-                    console.warn(`Rate limited (attempt ${attemptNo}/${MAX_RATE_LIMIT_ATTEMPTS}), waiting ${delayMs}ms${clampNote}`);
-                  },
-                },
-              );
+              });
               // The backoff sleep is the one place a turn can silently burn
               // minutes; converting a long Retry-After wait into a clean budget
               // stop here means the deadline never wedges the session lock.
@@ -606,23 +652,14 @@ export class CoachAgent {
               serverErrorAttempts < MAX_SERVER_ERROR_ATTEMPTS
             ) {
               serverErrorAttempts++;
-              const retryAfterFloor = extractRetryAfterMs(err);
-              let retried = false;
-              await retryWithBackoff(
-                async () => {
-                  if (!retried) {
-                    retried = true;
-                    throw err;
-                  }
-                },
-                {
-                  attempts: 2,
-                  baseMs: retryAfterFloor ?? SERVER_ERROR_BACKOFF_BASE_MS,
-                  capMs: SERVER_ERROR_BACKOFF_MAX_MS,
-                  shouldRetry: () => true,
-                  retryAfterMs: () => retryAfterFloor,
-                },
-              );
+              const retryAfterFloor = retryAfterFloorMs(err);
+              await backoffWithSentinelError(err, {
+                attempts: 2,
+                baseMs: retryAfterFloor ?? SERVER_ERROR_BACKOFF_BASE_MS,
+                capMs: SERVER_ERROR_BACKOFF_MAX_MS,
+                shouldRetry: () => true,
+                retryAfterMs: () => retryAfterFloor,
+              });
               turnBudget.checkDeadline();
               continue;
             }
