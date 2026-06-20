@@ -34,6 +34,25 @@ export type { GenerateOpts, GenerateResult } from "./llm-types.js";
 // the ledger (best-effort, by design).
 const PI_AI_PRICED = new Set<KnownProvider>(["anthropic", "openai", "google", "openrouter", "zai"]);
 
+// Most providers cache the stable system prefix automatically server-side and
+// get the plain system string, so they are absent here: direct openai/google,
+// the OpenAI-compatible direct providers, and OpenRouter's OpenAI/DeepSeek/
+// Grok/Moonshot routes. Explicit breakpoints are needed by direct Anthropic and
+// — through OpenRouter — the Anthropic/Qwen/Gemini routes; of those we ship only
+// the Qwen route (`qwen/`-namespaced ids), so `anthropic/` and `google/` via
+// OpenRouter are intentionally out of scope and stay uncached. (Same breakpoint
+// shape as Anthropic; only the providerOptions key differs —
+// @openrouter/ai-sdk-provider reads it from message-level
+// providerOptions.openrouter.cacheControl.)
+export function cacheBreakpointKey(
+  provider: string,
+  model: string,
+): "anthropic" | "openrouter" | undefined {
+  if (provider === "anthropic") return "anthropic";
+  if (provider === "openrouter" && model.startsWith("qwen/")) return "openrouter";
+  return undefined;
+}
+
 export class LLM {
   private config: Config;
   private aiSdkModel: LanguageModel | null;
@@ -41,6 +60,9 @@ export class LLM {
   // once here. getModels() allocates a fresh array per call, so doing this in
   // generate() would re-scan the catalog on every LLM round-trip.
   private pricingModel: Model<Api> | null;
+  // Instance-constant for the same reason: the cache-breakpoint decision depends
+  // only on provider + model, so resolve it once rather than per dispatch().
+  private breakpointKey: "anthropic" | "openrouter" | undefined;
 
   constructor(config: Config) {
     this.config = config;
@@ -50,6 +72,7 @@ export class LLM {
           (m) => m.id === config.llm.model,
         ) ?? null)
       : null;
+    this.breakpointKey = cacheBreakpointKey(config.llm.provider, config.llm.model);
   }
 
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
@@ -74,18 +97,17 @@ export class LLM {
       throw new Error("AI SDK model not initialized");
     }
 
-    // Breakpoint on the last (only) stable system block; the provider renders
-    // tools before system, so the marker caches tools + system together. The
-    // cacheControl directive is Anthropic-specific — openai/google get the plain
-    // system string. A second AI-SDK provider that needs prompt caching adds its
-    // own branch here rather than extending this Anthropic-only one.
+    // The provider renders tools before system, so breakpointing the (only)
+    // stable system block caches tools + system together. Which providers need a
+    // breakpoint, and why the rest don't, lives on cacheBreakpointKey above.
+    const breakpointKey = this.breakpointKey;
     const cachedSystem =
-      this.config.llm.provider === "anthropic" && opts.system !== undefined
+      breakpointKey !== undefined && opts.system !== undefined
         ? [
             {
               role: "system" as const,
               content: opts.system,
-              providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+              providerOptions: { [breakpointKey]: { cacheControl: { type: "ephemeral" } } },
             },
           ]
         : undefined;
