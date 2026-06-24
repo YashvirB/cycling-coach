@@ -8,7 +8,7 @@ import {
 } from "../freshness.js";
 import { atomicWriteJson } from "../../io/atomic-write-json.js";
 import { safeReadJson } from "../../io/safe-read-json.js";
-import { LATEST_SCHEMA_VERSION, LatestJsonSchema } from "../schemas/latest.js";
+import { LATEST_SCHEMA_VERSION, LatestJsonSchema, type DerivedMetricsMeta } from "../schemas/latest.js";
 import { HISTORY_SCHEMA_VERSION, HistoryJsonSchema } from "../schemas/history.js";
 import { INTERVALS_SCHEMA_VERSION, IntervalsJsonSchema } from "../schemas/intervals.js";
 import { ROUTES_SCHEMA_VERSION, RoutesJsonSchema } from "../schemas/routes.js";
@@ -87,12 +87,7 @@ export interface FetchedReference {
      *  it. Optional: an empty-coverage bundle attaches no tag. `prescriptionBasis`
      *  is the adapter's declared prescription anchor; `analysisBasis` is the
      *  substrate the distribution numbers were actually computed off. */
-    readonly derived_metrics_meta?: {
-      readonly sportFamily: string;
-      readonly prescriptionBasis: "power" | "pace";
-      readonly anchorType: "critical-speed" | "ftp";
-      readonly analysisBasis: "power" | "hr" | "mixed" | null;
-    };
+    readonly derived_metrics_meta?: DerivedMetricsMeta;
     readonly recent_activities: readonly unknown[];
     readonly planned_workouts: readonly unknown[];
     readonly wellness_data: unknown;

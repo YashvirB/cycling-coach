@@ -14,13 +14,13 @@ import { fetchLiveBundle, type BundleFetchClient } from "../src/reference/sync/f
 import { buildMetricInput } from "../src/reference/sync/fixture-bridge.js";
 import { computeDerivedMetrics } from "../src/reference/sync/compute-derived-metrics.js";
 import { runAdaptersForActivities } from "../src/reference/sport-adapter-dispatcher.js";
+import { composeProvenance, readAnalysisBasis } from "../src/reference/sync/fetch-reference-data.js";
 import type { ReferenceSportAdapter } from "../src/reference/sport-adapter.js";
 import type { IntervalsActivityType } from "../src/sport.js";
 import type { FetchedReference } from "../src/reference/sync/run-sync.js";
 import { gateLatestJson } from "../src/reference/validation/sync-gate.js";
 import { LatestJsonSchema, LATEST_SCHEMA_VERSION, type LatestJson } from "../src/reference/schemas/latest.js";
 import { METRIC_REGISTRY } from "../src/reference/metrics/registry.js";
-import { SPORT_FAMILIES } from "../src/reference/metrics/sport-families.js";
 import { safeReadJson } from "../src/io/safe-read-json.js";
 
 const NOW = new Date("2026-06-09T12:00:00.000Z");
@@ -76,21 +76,16 @@ function fakeClient(): BundleFetchClient {
   };
 }
 
-type DerivedMetricsMeta = NonNullable<LatestJson["derived_metrics_meta"]>;
-
-/** Compose exactly as the production `fetchOnce` does. */
+/** Compose exactly as the production `fetchOnce` does — through the shared
+ *  `composeProvenance` helper, so the test exercises the production logic. */
 async function composeFetched(): Promise<FetchedReference> {
   const live = await fetchLiveBundle({ client: fakeClient(), signal: new AbortController().signal, now: NOW, throttleMs: 0 });
   const runs = runAdaptersForActivities([CYCLING_ADAPTER], SPORT_TYPES, live.bundle.activities);
-  const coveredPowerBasis = runs.some((r) => r.adapter.zoneBasis === "power");
-  const omitPowerFamily = runs.length > 0 && !coveredPowerBasis;
+  const { omitPowerFamily, meta: baseMeta } = composeProvenance(runs);
   const derived_metrics = computeDerivedMetrics(buildMetricInput(live.bundle, live.frozenNow), { omitPowerFamily });
-  const zoneDist = derived_metrics["zone_distribution_7d"];
-  const analysisBasis: "power" | "hr" | "mixed" | null =
-    zoneDist !== null && typeof zoneDist === "object" && "zone_basis" in zoneDist
-      ? ((zoneDist as { zone_basis: "power" | "hr" | "mixed" | null }).zone_basis ?? null)
-      : null;
-  const meta = deriveMeta(runs, analysisBasis);
+  const meta = baseMeta
+    ? { ...baseMeta, analysisBasis: readAnalysisBasis(derived_metrics) }
+    : undefined;
   return {
     latest: {
       athlete_profile: live.athleteProfile,
@@ -105,30 +100,6 @@ async function composeFetched(): Promise<FetchedReference> {
     intervals: { by_activity: {} },
     routes: { routes: [] },
     ftp_history: { entries: [] },
-  };
-}
-
-/**
- * Local reconstruction of `fetchOnce`'s private `deriveMeta`: pick the covering
- * adapter (power-basis preferred), then attribute its sport family + basis +
- * anchor. Returns undefined for empty coverage so the optional tag stays off.
- */
-function deriveMeta(
-  runs: ReturnType<typeof runAdaptersForActivities>,
-  analysisBasis: "power" | "hr" | "mixed" | null,
-): DerivedMetricsMeta | undefined {
-  if (runs.length === 0) return undefined;
-  const covering = runs.find((r) => r.adapter.zoneBasis === "power")?.adapter ?? runs[0].adapter;
-  const firstType = covering.activityTypes[0];
-  const sportFamily =
-    firstType !== undefined && Object.hasOwn(SPORT_FAMILIES, firstType)
-      ? SPORT_FAMILIES[firstType]
-      : "other";
-  return {
-    sportFamily,
-    prescriptionBasis: covering.zoneBasis as "power" | "pace",
-    anchorType: covering.anchorType,
-    analysisBasis,
   };
 }
 

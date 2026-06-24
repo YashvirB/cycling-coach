@@ -7,52 +7,72 @@ import { buildMetricInput } from "./fixture-bridge.js";
 import { computeDerivedMetrics } from "./compute-derived-metrics.js";
 import {
   runAdaptersForActivities,
+  familyOf,
   type AdapterRun,
 } from "../sport-adapter-dispatcher.js";
 import type { ReferenceSportAdapter } from "../sport-adapter.js";
 import type { IntervalsActivityType } from "../../sport.js";
-import { SPORT_FAMILIES } from "../metrics/sport-families.js";
+import type { DerivedMetricsMeta } from "../schemas/latest.js";
 
-interface DerivedMetricsMeta {
-  readonly sportFamily: string;
-  readonly prescriptionBasis: "power" | "pace";
-  readonly anchorType: "critical-speed" | "ftp";
-  readonly analysisBasis: "power" | "hr" | "mixed" | null;
+/**
+ * Resolve, in a single scan of `runs`, the watts-fence decision plus the
+ * runs-derivable portion of the emit-time provenance tag from one representative
+ * covering adapter:
+ *
+ *   - The representative is the power-basis covering adapter when one is present
+ *     (so a mixed bundle — a duathlete's Ride+Run — keeps its power family and
+ *     tags as cycling/power), else the first covering adapter.
+ *   - `omitPowerFamily` is a positive pace-sport assertion: at least one
+ *     activity is covered AND the representative is not power-basis. An
+ *     empty-coverage bundle keeps the full family (no positive signal).
+ *   - `meta` is `undefined` for an empty-coverage bundle (no adapter to
+ *     attribute); otherwise it carries the representative's family +
+ *     prescription anchor + anchor type. The family falls back to `"other"` for
+ *     an unmapped or missing first activity type.
+ *
+ * The fourth meta field, `analysisBasis`, is NOT derivable here — it reads off
+ * the OUTPUT of `computeDerivedMetrics` (see `readAnalysisBasis`), so the caller
+ * folds it in post-compute. The `Omit` return type makes that debt explicit to
+ * the compiler; keep it explicit, never widened back to the full type.
+ */
+export function composeProvenance(runs: readonly AdapterRun[]): {
+  omitPowerFamily: boolean;
+  meta: Omit<DerivedMetricsMeta, "analysisBasis"> | undefined;
+} {
+  if (runs.length === 0) return { omitPowerFamily: false, meta: undefined };
+  const covering =
+    runs.find((r) => r.adapter.zoneBasis === "power")?.adapter ?? runs[0].adapter;
+  const omitPowerFamily = covering.zoneBasis !== "power";
+  const firstType = covering.activityTypes[0];
+  const sportFamily = firstType !== undefined ? familyOf(firstType, "other") : "other";
+  return {
+    omitPowerFamily,
+    meta: {
+      sportFamily,
+      // No shipped adapter declares a 'hr' prescription anchor; only power/pace
+      // are instantiated, so narrowing off the wider interface type is safe.
+      prescriptionBasis: covering.zoneBasis as "power" | "pace",
+      anchorType: covering.anchorType,
+    },
+  };
 }
 
 /**
- * Derive the emit-time provenance tag from the covering adapters. Prefers a
- * power-basis adapter when one is present so a mixed bundle (a duathlete's
- * Ride+Run) tags as its kept power family, matching the omission decision;
- * otherwise the first covering adapter wins. Returns `undefined` for an
- * empty-coverage bundle (no adapter to attribute), leaving the optional tag off.
- *
- * `prescriptionBasis` is the adapter's declared prescription anchor
- * (`zoneBasis`) — what zones we'd write a workout against. `analysisBasis` is
- * the substrate the distribution numbers were ACTUALLY computed off (the
- * registry's `zone_distribution_7d.zone_basis`: power|hr|mixed|null) — for a
- * power-less run these diverge (prescription `pace`, analysis `hr`).
+ * Read the actual analysis substrate off the already-computed window metric —
+ * never recompute it. `zone_distribution_7d.zone_basis` is the canonical
+ * window-level substrate (distribution.ts emits it). Returns null when the
+ * metric is absent or not an object (defensive — the omitPowerFamily fence does
+ * NOT strip zone_distribution_7d today, but guard anyway). This is the substrate
+ * the distribution numbers were ACTUALLY computed off; it diverges from a
+ * pace-sport's `prescriptionBasis` (prescription `pace`, analysis `hr`).
  */
-function deriveMeta(
-  runs: readonly AdapterRun[],
-  analysisBasis: "power" | "hr" | "mixed" | null,
-): DerivedMetricsMeta | undefined {
-  if (runs.length === 0) return undefined;
-  const covering =
-    runs.find((r) => r.adapter.zoneBasis === "power")?.adapter ?? runs[0].adapter;
-  const firstType = covering.activityTypes[0];
-  const sportFamily =
-    firstType !== undefined && Object.hasOwn(SPORT_FAMILIES, firstType)
-      ? SPORT_FAMILIES[firstType]
-      : "other";
-  return {
-    sportFamily,
-    // No shipped adapter declares a 'hr' prescription anchor; only power/pace
-    // are instantiated, so narrowing off the wider interface type is safe.
-    prescriptionBasis: covering.zoneBasis as "power" | "pace",
-    anchorType: covering.anchorType,
-    analysisBasis,
-  };
+export function readAnalysisBasis(
+  derivedMetrics: Record<string, unknown>,
+): "power" | "hr" | "mixed" | null {
+  const zoneDist = derivedMetrics["zone_distribution_7d"];
+  return zoneDist !== null && typeof zoneDist === "object" && "zone_basis" in zoneDist
+    ? ((zoneDist as { zone_basis: "power" | "hr" | "mixed" | null }).zone_basis ?? null)
+    : null;
 }
 
 /**
@@ -100,26 +120,17 @@ async function fetchOnce(
     sportTypes,
     live.bundle.activities,
   );
-  // Omit the power family only on a positive pace-sport assertion: at least one
-  // activity is covered AND no covering adapter is power-basis. An
-  // empty-coverage bundle keeps the full family (no positive signal).
-  const coveredPowerBasis = runs.some((r) => r.adapter.zoneBasis === "power");
-  const omitPowerFamily = runs.length > 0 && !coveredPowerBasis;
+  const { omitPowerFamily, meta: baseMeta } = composeProvenance(runs);
   const derivedMetrics = computeDerivedMetrics(
     buildMetricInput(live.bundle, live.frozenNow),
     { omitPowerFamily },
   );
-  // Read the actual analysis substrate off the already-computed window metric —
-  // never recompute it. `zone_distribution_7d.zone_basis` is the canonical
-  // window-level substrate (distribution.ts emits it). Default to null when the
-  // metric is absent or not an object (defensive — the omitPowerFamily fence
-  // does NOT strip zone_distribution_7d today, but guard anyway).
-  const zoneDist = derivedMetrics["zone_distribution_7d"];
-  const analysisBasis =
-    zoneDist !== null && typeof zoneDist === "object" && "zone_basis" in zoneDist
-      ? ((zoneDist as { zone_basis: "power" | "hr" | "mixed" | null }).zone_basis ?? null)
-      : null;
-  const meta = deriveMeta(runs, analysisBasis);
+  // analysisBasis is a compute OUTPUT (read off the registry's emitted
+  // zone_distribution_7d), so it joins the runs-derivable meta only after
+  // compute. baseMeta is undefined exactly for an empty-coverage bundle.
+  const meta = baseMeta
+    ? { ...baseMeta, analysisBasis: readAnalysisBasis(derivedMetrics) }
+    : undefined;
 
   return {
     latest: {
