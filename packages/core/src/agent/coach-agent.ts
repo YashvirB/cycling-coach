@@ -23,6 +23,7 @@ import { buildSystemPrompt, staticRuleBlocks } from "./system-prompt.js";
 import { computeAssembledHash, computeTemplateHash, sha256_16 } from "./prompt-lineage.js";
 import { withSessionLock } from "./session-lock.js";
 import { capToolResult, TOOL_RESULT_SHARE } from "./tool-result-cap.js";
+import { memoizeReadTool } from "./read-memoizer.js";
 import { splitHistoryByBudget, makeSummaryMessage } from "./history-limit.js";
 import {
   shouldCompact,
@@ -176,6 +177,13 @@ export class CoachAgent {
   private turnWrites: { writesCommitted: number; lastWriteSummary?: string } = {
     writesCommitted: 0,
   };
+  // Per-turn read memoizer cache. Held in async-context storage (mirroring
+  // resolvedCsStore below) rather than a shared instance field so that
+  // concurrent fire-and-forget turns each memoize into their OWN map and can
+  // neither read nor clear another turn's entries; chat() runs every turn
+  // inside a fresh map. The wrapped read tools (built once at construction)
+  // resolve the running turn's map lazily through this store.
+  private readonly readToolCacheStore = new AsyncLocalStorage<Map<string, unknown>>();
   // Resolved primary anchor (running CS) for the in-flight turn. Held in
   // async-context storage rather than a shared instance field so that
   // fire-and-forget turns running concurrently (different chats, or rapid
@@ -226,7 +234,11 @@ export class CoachAgent {
     this.tools = Object.fromEntries(
       registrations.map((r) => [
         r.name,
-        this.wrapWriteTool(r.name, capToolResult(r.tool, { maxResultTokens })),
+        memoizeReadTool(
+          r.name,
+          this.wrapWriteTool(r.name, capToolResult(r.tool, { maxResultTokens })),
+          () => this.readToolCacheStore.getStore(),
+        ),
       ]),
     ) as ToolSet;
     // systemPrompt is rebuilt at the top of every chat() call; no need to bake one here.
@@ -398,6 +410,7 @@ export class CoachAgent {
     // channel supplies nothing (CLI path, no sync data).
     const resolvedCs = turn?.resolvedCs ?? null;
     return this.resolvedCsStore.run(resolvedCs, () =>
+      this.readToolCacheStore.run(new Map<string, unknown>(), () =>
       withSessionLock(chatId, async () => {
       const turnStart = Date.now();
       const turnId = randomUUID();
@@ -803,6 +816,7 @@ export class CoachAgent {
         throw terminalErr;
       }
       }),
+      ),
     );
   }
 
