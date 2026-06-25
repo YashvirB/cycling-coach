@@ -1,3 +1,4 @@
+import { escapeHtmlText } from "../../channels/html-escape.js";
 import {
   SNAPSHOT_DOCUMENT_THRESHOLD_BYTES,
   SNAPSHOT_DOCUMENT_THRESHOLD_CHUNKS,
@@ -5,12 +6,15 @@ import {
 import type { LatestJson } from "../schemas/latest.js";
 
 const TELEGRAM_MAX_CHUNK = 4096;
-// Wrap inside ```json ... ``` fences for readability; reserve overhead for the
-// fences themselves so the body fits.
-const FENCE_OPEN = "```json\n";
+// Each chunk is a code fence the Telegram HTML path renders as an escaped
+// <pre> block (the snapshot reply runs every chunk through markdownToTelegramHtml).
+const FENCE_OPEN = "```\n";
 const FENCE_CLOSE = "\n```";
-const FENCE_OVERHEAD = FENCE_OPEN.length + FENCE_CLOSE.length;
-const BODY_BUDGET = TELEGRAM_MAX_CHUNK - FENCE_OVERHEAD;
+// Room the rendered `<pre>${escapeHtmlText(body)}</pre>` leaves for the body.
+// The trailing `-1` reserves the leading `\n` of FENCE_CLOSE: FENCE_RE captures
+// `slice + "\n"` as the fence body, so the restored <pre> carries one extra char
+// the `<pre></pre>` overhead alone doesn't account for.
+const RENDERED_BUDGET = TELEGRAM_MAX_CHUNK - "<pre></pre>".length - 1;
 
 const VALID_SECTIONS: readonly (keyof LatestJson)[] = [
   "athlete_profile",
@@ -89,11 +93,34 @@ function wrap(body: string): SnapshotOutput {
   return { kind: "chunks", chunks };
 }
 
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+// Each emitted chunk is a code fence the HTML path restores as
+// `<pre>${escapeHtmlText(body)}</pre>`. Budget by the RENDERED length, not the
+// raw length: a slice dense with `& < >` expands under escaping (`&`→`&amp;` is
+// +4), so a raw-length budget could render a <pre> past Telegram's 4096 limit,
+// and the converter's own chunker would then re-split it — breaking the 1:1
+// raw→sent mapping the snapshot retry relies on. Growing the slice until the
+// rendered <pre> would overflow guarantees one sub-chunk out per raw chunk.
 function splitIntoChunks(body: string): readonly string[] {
   const out: string[] = [];
-  for (let i = 0; i < body.length; i += BODY_BUDGET) {
-    const slice = body.slice(i, i + BODY_BUDGET);
-    out.push(`${FENCE_OPEN}${slice}${FENCE_CLOSE}`);
+  let i = 0;
+  while (i < body.length) {
+    let rendered = 0;
+    let j = i;
+    while (j < body.length) {
+      const next = escapeHtmlText(body[j]).length;
+      if (rendered + next > RENDERED_BUDGET) break;
+      rendered += next;
+      j++;
+    }
+    // Don't cut between the halves of a surrogate pair (but always make progress).
+    if (j > i + 1 && j < body.length && isHighSurrogate(body.charCodeAt(j - 1))) j--;
+    // A single char can never exceed the budget, so j always advances past i.
+    out.push(`${FENCE_OPEN}${body.slice(i, j)}${FENCE_CLOSE}`);
+    i = j;
   }
   return out;
 }

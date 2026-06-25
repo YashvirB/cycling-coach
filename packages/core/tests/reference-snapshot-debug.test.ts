@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatSnapshotRaw } from "../src/reference/sync/snapshot-debug.js";
+import { markdownToTelegramHtml, chunkHtml } from "../src/channels/telegram.js";
 import type { LatestJson } from "../src/reference/schemas/latest.js";
 
 const tinyLatest: LatestJson = {
@@ -27,19 +28,75 @@ describe("formatSnapshotRaw", () => {
     }
   });
 
-  it("returns chunked markdown for a small full dump (each chunk ≤4096 chars)", () => {
+  it("returns HTML-path-renderable chunks for a small full dump (each chunk ≤4096 chars)", () => {
     const out = formatSnapshotRaw(tinyLatest);
     expect(out.kind).toBe("chunks");
     if (out.kind === "chunks") {
       expect(out.chunks.length).toBeGreaterThanOrEqual(1);
       for (const chunk of out.chunks) {
         expect(chunk.length).toBeLessThanOrEqual(4096);
-        expect(chunk.startsWith("```json")).toBe(true);
-        expect(chunk.endsWith("```")).toBe(true);
+        // Each chunk is a plain code fence the HTML path renders as an escaped
+        // <pre> block (no language tag, no legacy ```json wrapper).
+        expect(chunk.startsWith("```\n")).toBe(true);
+        expect(chunk.endsWith("\n```")).toBe(true);
+        expect(chunk.startsWith("```json")).toBe(false);
       }
       // The serialized data should appear somewhere in the chunks.
       expect(out.chunks.join("")).toContain("\"id\": \"test\"");
       expect(out.chunks.join("")).toContain("\"sleep_hours\": 7.5");
+    }
+  });
+
+  it("renders every chunk to a single <pre> within Telegram's limit even when the body is escape-dense", () => {
+    // intervals.icu activity names/descriptions are Strava-mirrored and can be
+    // dense with `& < >`, which expand under HTML escaping (`&`→`&amp;` is +4).
+    // If the chunk budget ignored that expansion, a rendered <pre> would overflow
+    // 4096 and the converter's chunker would re-split it — breaking the 1:1
+    // raw→sent mapping the snapshot retry relies on.
+    const escapeDense: LatestJson = {
+      ...tinyLatest,
+      recent_activities: [{ id: 1, name: "<&>".repeat(1000) }],
+    };
+    const out = formatSnapshotRaw(escapeDense);
+    expect(out.kind).toBe("chunks");
+    if (out.kind === "chunks") {
+      expect(out.chunks.length).toBeGreaterThan(1);
+      for (const chunk of out.chunks) {
+        const rendered = markdownToTelegramHtml(chunk);
+        expect(rendered.length).toBeLessThanOrEqual(4096);
+        expect(chunkHtml(rendered)).toHaveLength(1);
+      }
+    }
+  });
+
+  it("keeps a budget-filling plain-ASCII chunk inside Telegram's limit (1:1 raw→sent)", () => {
+    // The COMMON case: JSON snapshots are predominantly ASCII, where each char
+    // escapes to length 1, so a full-size chunk fills the rendered budget exactly.
+    // FENCE_RE captures `slice + "\n"` (the leading newline of the closing fence)
+    // as the <pre> body, so the restored block carries one char the `<pre></pre>`
+    // overhead alone never reserves. Sizing the section so a slice lands on the
+    // budget boundary exercises that path: without the trailing -1 in
+    // RENDERED_BUDGET the rendered <pre> would be 4097, defeating the 1:1
+    // raw→sent invariant this chunker exists to guarantee.
+    const asciiHeavy: LatestJson = {
+      ...tinyLatest,
+      derived_metrics: { note: "z".repeat(9000) },
+    };
+    const out = formatSnapshotRaw(asciiHeavy);
+    expect(out.kind).toBe("chunks");
+    if (out.kind === "chunks") {
+      expect(out.chunks.length).toBeGreaterThan(1);
+      // At least one chunk must actually fill the budget — otherwise the test
+      // never exercises the boundary it's meant to guard.
+      const maxRendered = Math.max(
+        ...out.chunks.map((chunk) => markdownToTelegramHtml(chunk).length),
+      );
+      expect(maxRendered).toBe(4096);
+      for (const chunk of out.chunks) {
+        const rendered = markdownToTelegramHtml(chunk);
+        expect(rendered.length).toBeLessThanOrEqual(4096);
+        expect(chunkHtml(rendered)).toHaveLength(1);
+      }
     }
   });
 
