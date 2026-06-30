@@ -148,10 +148,26 @@ describe("codex-bridge", () => {
       profileName: "openai-codex",
     });
 
-    expect(freshToken).toHaveBeenCalledWith("openai-codex");
+    expect(freshToken).toHaveBeenCalledWith("openai-codex", undefined);
     expect(complete).toHaveBeenCalledWith(
       expect.objectContaining({ accessToken: "fresh-token-abc", modelId: "gpt-5.4" }),
     );
+  });
+
+  it("threads the per-call abort signal into getFreshToken so the token refresh shares the deadline", async () => {
+    const complete = vi.fn(async () => asstMsg());
+    const freshToken = vi.fn(async () => "fresh-token-abc");
+    const { codexGenerateText } = await loadBridgeWithMocks({ complete, freshToken });
+    const controller = new AbortController();
+
+    await codexGenerateText({
+      messages: [{ role: "user", content: "hi" }],
+      modelId: "gpt-5.4",
+      profileName: "openai-codex",
+      signal: controller.signal,
+    });
+
+    expect(freshToken).toHaveBeenCalledWith("openai-codex", controller.signal);
   });
 
   it("forwards opts.cacheKey as the request sessionId; omits it when absent", async () => {
@@ -181,6 +197,23 @@ describe("codex-bridge", () => {
 
     expect(completeNoKey).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: undefined }),
+    );
+  });
+
+  it("forwards opts.signal to the codex response request", async () => {
+    const complete = vi.fn(async () => asstMsg());
+    const { codexGenerateText } = await loadBridgeWithMocks({ complete });
+    const signal = new AbortController().signal;
+
+    await codexGenerateText({
+      messages: [{ role: "user", content: "hi" }],
+      modelId: "gpt-5.4",
+      profileName: "openai-codex",
+      signal,
+    });
+
+    expect(complete).toHaveBeenCalledWith(
+      expect.objectContaining({ signal }),
     );
   });
 
@@ -291,6 +324,44 @@ describe("codex-bridge", () => {
     const toolMsg = conversations[1].messages.find((m) => m.role === "tool");
     expect(toolMsg).toBeDefined();
     expect(JSON.stringify(toolMsg!.content)).toContain("logged 60");
+  });
+
+  it("forwards opts.signal to codex tool execution", async () => {
+    let toolOptions: { abortSignal?: AbortSignal } | undefined;
+    const execute = vi.fn(async (_input: { minutes: number }, options: { abortSignal?: AbortSignal }) => {
+      toolOptions = options;
+      return "logged";
+    });
+    const tools = {
+      log_ride: {
+        description: "log a ride",
+        inputSchema: zodSchema(z.object({ minutes: z.number() })),
+        execute,
+      },
+    };
+    const complete = vi.fn(async (params: { messages: Array<Record<string, unknown>> }) => {
+      const hasToolResult = params.messages.some((m) => m.role === "tool");
+      if (!hasToolResult) {
+        return asstMsg({
+          stopReason: "toolUse",
+          toolCalls: [{ id: "c1", name: "log_ride", arguments: { minutes: 60 } }],
+        });
+      }
+      return asstMsg();
+    });
+    const { codexGenerateText } = await loadBridgeWithMocks({ complete });
+    const signal = new AbortController().signal;
+
+    await codexGenerateText({
+      messages: [{ role: "user", content: "hi" }],
+      tools: tools as never,
+      modelId: "gpt-5.4",
+      profileName: "openai-codex",
+      signal,
+    });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(toolOptions?.abortSignal).toBe(signal);
   });
 
   it("does not leak fake tokens via console.warn/error", async () => {

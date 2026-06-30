@@ -51,6 +51,7 @@ import { TAINTED_BY_WRITES_MESSAGE, STEP_LIMIT_TRUNCATION_MESSAGE } from "./coac
 
 const MAX_OVERFLOW_ATTEMPTS = 3;
 const MAX_TIMEOUT_ATTEMPTS = 2;
+const MAX_PLAIN_TIMEOUT_ATTEMPTS = 1;
 const MAX_RATE_LIMIT_ATTEMPTS = 3;
 const MAX_SERVER_ERROR_ATTEMPTS = 2;
 const SERVER_ERROR_BACKOFF_BASE_MS = 500;
@@ -72,9 +73,15 @@ const RATE_LIMIT_FALLBACK_MAX_MS = 30_000;
 const RATE_LIMIT_MAX_WAIT_MS = 120_000;
 const MAX_FLUSH_ATTEMPTS = 2;
 
-// Calendar write tools whose committed success makes a turn non-replayable.
-// Kept here so the taint set can't drift from the actual tool names.
-const WRITE_TOOL_NAMES = new Set(["intervals_create_workout", "intervals_delete_workout"]);
+const REPLAY_UNSAFE_TOOL_NAMES = new Set([
+  "intervals_create_workout",
+  "intervals_delete_workout",
+  "memory_write",
+  "plan_save",
+  // Commits a plan via memory.savePlan — the same non-idempotent side effect as
+  // plan_save — so a retry must not replay it. Recognized in committedWriteSummary.
+  "build_plan_skeleton",
+]);
 
 // A turn that spent its whole step budget on tool calls (or hit the output-token
 // cap) and never emitted final text. Kept a single named predicate so the future
@@ -128,6 +135,11 @@ interface TurnOutcome {
   compactions: number;
 }
 
+interface TurnWriteRecord {
+  writesCommitted: number;
+  lastWriteSummary?: string;
+}
+
 function classifyError(err: unknown): string {
   // TurnBudgetExceededError crosses a dynamic-import boundary in tests, so match
   // on the structural name rather than instanceof.
@@ -154,6 +166,19 @@ function backoffWithSentinelError(
   }, opts);
 }
 
+function committedWriteSummary(name: string, result: unknown): string | undefined {
+  if (result === null || typeof result !== "object") return undefined;
+  const out = result as { created?: unknown; deleted?: unknown; saved?: unknown; phases?: unknown };
+  if (out.created === true) return "created a workout on the calendar";
+  if (out.deleted === true) return "deleted a scheduled workout";
+  if (out.saved === true && name === "memory_write") return "saved athlete memory";
+  if (out.saved === true && name === "plan_save") return "saved the training plan";
+  // build_plan_skeleton returns the saved plan itself (a phases-bearing object),
+  // not a {saved:true} ack, so recognize its success by the plan shape.
+  if (name === "build_plan_skeleton" && Array.isArray(out.phases)) return "built training plan";
+  return undefined;
+}
+
 // ============================================================================
 // AGENT
 // ============================================================================
@@ -171,12 +196,10 @@ export class CoachAgent {
   private tz: string;
   private archiveDeferred = new Set<string>();
   private lastFlushMessageCount = new Map<string, number>();
-  // Per-turn record of committed calendar writes, reset at the top of chat().
-  // A committed write makes the turn non-replayable: the retry loop re-sends the
-  // pre-turn messages, so a second generate could re-run a non-idempotent create.
-  private turnWrites: { writesCommitted: number; lastWriteSummary?: string } = {
-    writesCommitted: 0,
-  };
+  // A committed tool write makes the turn non-replayable: the retry loop re-sends
+  // the pre-turn messages, so a second generate could re-run the write. Keep it
+  // in async-local turn state so concurrent chats cannot reset each other.
+  private readonly turnWritesStore = new AsyncLocalStorage<TurnWriteRecord>();
   // Per-turn read memoizer cache. Held in async-context storage (mirroring
   // resolvedCsStore below) rather than a shared instance field so that
   // concurrent fire-and-forget turns each memoize into their OWN map and can
@@ -245,30 +268,23 @@ export class CoachAgent {
     this.systemPrompt = "";
   }
 
-  // Agent-owned wrapper that records a committed calendar write the moment its
+  // Agent-owned wrapper that records a committed tool write the moment its
   // tool executes — at the execution boundary, not from the generate result,
   // because result.toolCalls carries only the last agentic step and would miss
   // a write committed on an earlier step. Non-write tools pass through untouched.
   private wrapWriteTool(name: string, tool: Tool): Tool {
-    if (!WRITE_TOOL_NAMES.has(name)) return tool;
+    if (!REPLAY_UNSAFE_TOOL_NAMES.has(name)) return tool;
     const inner = tool.execute;
     if (typeof inner !== "function") return tool;
-    const record = this.turnWrites;
     return {
       ...tool,
       execute: async (input: unknown, options: unknown) => {
         const result = await (inner as (i: unknown, o: unknown) => unknown)(input, options);
-        if (
-          result !== null &&
-          typeof result === "object" &&
-          ((result as { created?: unknown }).created === true ||
-            (result as { deleted?: unknown }).deleted === true)
-        ) {
+        const summary = committedWriteSummary(name, result);
+        const record = this.turnWritesStore.getStore();
+        if (record !== undefined && summary !== undefined) {
           record.writesCommitted++;
-          record.lastWriteSummary =
-            (result as { created?: unknown }).created === true
-              ? "created a workout on the calendar"
-              : "deleted a scheduled workout";
+          record.lastWriteSummary = summary;
         }
         return result;
       },
@@ -370,6 +386,7 @@ export class CoachAgent {
         tools: undefined,
         caller: "chat",
         cacheKey,
+        deadlineMs: turnBudget.remainingMs(),
       });
       return recovery.text.trim() !== "" ? recovery.text : STEP_LIMIT_TRUNCATION_MESSAGE;
     } catch (recoveryErr) {
@@ -409,17 +426,15 @@ export class CoachAgent {
     // fire-and-forget turns never clobber each other's anchor. null when the
     // channel supplies nothing (CLI path, no sync data).
     const resolvedCs = turn?.resolvedCs ?? null;
+    const turnWrites: TurnWriteRecord = { writesCommitted: 0 };
     return this.resolvedCsStore.run(resolvedCs, () =>
       this.readToolCacheStore.run(new Map<string, unknown>(), () =>
-      withSessionLock(chatId, async () => {
+        this.turnWritesStore.run(turnWrites, () =>
+          withSessionLock(chatId, async () => {
       const turnStart = Date.now();
       const turnId = randomUUID();
       let compactions = 0;
       const turnBudget = createTurnBudget(() => Date.now());
-      // Reset the per-turn write record in place (the wrapped write tools hold a
-      // reference to this object, captured once at construction).
-      this.turnWrites.writesCommitted = 0;
-      this.turnWrites.lastWriteSummary = undefined;
       // One flush per turn: the latch flips on entry (before the await
       // resolves) so a thrown flush still consumes the turn's single flush.
       let flushedThisTurn = false;
@@ -555,6 +570,7 @@ export class CoachAgent {
 
       let overflowAttempts = 0;
       let timeoutAttempts = 0;
+      let plainTimeoutAttempts = 0;
       let rateLimitAttempts = 0;
       let serverErrorAttempts = 0;
 
@@ -594,6 +610,9 @@ export class CoachAgent {
               maxSteps: 10,
               caller: "chat",
               cacheKey,
+              // Cap this call by the turn's remaining wall-clock budget so a retry
+              // after an early timeout inherits only the time the turn has left.
+              deadlineMs: turnBudget.remainingMs(),
             });
             const { text, finishReason } = result;
 
@@ -665,15 +684,15 @@ export class CoachAgent {
             // retry branch so a future reordering can never mistake it for one of
             // the retryable classes and swallow it.
             if (err instanceof TurnBudgetExceededError) throw err;
-            // A committed calendar write makes this turn non-replayable: retrying
-            // would re-send the pre-turn messages and could re-run a
-            // non-idempotent create. Refuse honestly instead of looping.
-            if (this.turnWrites.writesCommitted > 0) {
+            // A committed tool write makes this turn non-replayable: retrying
+            // would re-send the pre-turn messages and could re-run the write.
+            const committedWrites = this.turnWritesStore.getStore() ?? turnWrites;
+            if (committedWrites.writesCommitted > 0) {
               console.warn(
                 JSON.stringify({
                   event: "turn_failed_after_write",
-                  writesCommitted: this.turnWrites.writesCommitted,
-                  lastWriteSummary: this.turnWrites.lastWriteSummary,
+                  writesCommitted: committedWrites.writesCommitted,
+                  lastWriteSummary: committedWrites.lastWriteSummary,
                   error: (err instanceof Error ? err.message : String(err)).slice(0, 200),
                 }),
               );
@@ -730,6 +749,11 @@ export class CoachAgent {
                   }
                   throw err;
                 }
+                continue;
+              }
+              if (plainTimeoutAttempts < MAX_PLAIN_TIMEOUT_ATTEMPTS) {
+                plainTimeoutAttempts++;
+                timeoutAttempts++;
                 continue;
               }
             }
@@ -816,6 +840,7 @@ export class CoachAgent {
         throw terminalErr;
       }
       }),
+        ),
       ),
     );
   }

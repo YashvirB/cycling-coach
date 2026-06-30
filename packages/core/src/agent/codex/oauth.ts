@@ -11,6 +11,7 @@ const SCOPE = "openid profile email offline_access";
 const CALLBACK_PORT = 1455;
 const CALLBACK_HOST = "127.0.0.1";
 const CALLBACK_PATH = "/auth/callback";
+const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 
 export interface CodexCredentials {
   access: string;
@@ -251,8 +252,21 @@ async function exchangeAuthorizationCode(
   };
 }
 
-async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
+function isAbortShaped(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const name = (error as { name?: unknown }).name;
+  return name === "AbortError" || name === "TimeoutError";
+}
+
+async function refreshAccessToken(
+  refreshToken: string,
+  signal?: AbortSignal,
+): Promise<TokenResult> {
   try {
+    // The token endpoint should respond quickly; bound it with a short timeout
+    // combined with the caller's deadline so a stall can't hang the turn.
+    const timeout = AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS);
+    const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const response = await fetch(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -261,6 +275,7 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
         refresh_token: refreshToken,
         client_id: CLIENT_ID,
       }),
+      signal: fetchSignal,
     });
     if (!response.ok) {
       console.error("[codex-oauth] Token refresh failed:", response.status);
@@ -286,6 +301,10 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
       expires: Date.now() + json.expires_in * 1000,
     };
   } catch (error) {
+    // A deadline or 30s-backstop abort is not a credential failure -- propagate it
+    // with its real shape so the retry/deny path is skipped and the surfaced error
+    // is the abort, not a misleading "re-run setup".
+    if (isAbortShaped(error) || signal?.aborted) throw error;
     console.error("[codex-oauth] Token refresh error:", error);
     return { type: "failed" };
   }
@@ -366,8 +385,11 @@ export async function loginCodex(options: CodexLoginOptions): Promise<CodexCrede
   }
 }
 
-export async function refreshCodexToken(refreshToken: string): Promise<CodexCredentials> {
-  const result = await refreshAccessToken(refreshToken);
+export async function refreshCodexToken(
+  refreshToken: string,
+  signal?: AbortSignal,
+): Promise<CodexCredentials> {
+  const result = await refreshAccessToken(refreshToken, signal);
   if (result.type !== "success") {
     throw new Error("Failed to refresh OpenAI Codex token");
   }

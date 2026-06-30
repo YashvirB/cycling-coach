@@ -17,6 +17,8 @@ import type { GenerateOpts, GenerateResult } from "./llm-types.js";
 import { appendUsageLine, cacheTokenDetails, usageFieldsFromResult } from "./usage-ledger.js";
 
 export type { GenerateOpts, GenerateResult } from "./llm-types.js";
+export const LLM_CALL_DEADLINE_MS = 180_000;
+export const CHAT_LLM_CALL_DEADLINE_MS = 300_000;
 
 // ============================================================================
 // LLM DISPATCH
@@ -61,7 +63,25 @@ export class LLM {
 
   async generate(opts: GenerateOpts): Promise<GenerateResult> {
     const start = Date.now();
-    const result = await this.dispatch(opts);
+    // The per-call deadline is the caller's class budget intersected with any
+    // turn-remaining bound the agent loop passes, so a retry after an early
+    // timeout inherits only the time the turn has left — never a fresh window.
+    const deadlineMs = Math.min(
+      deadlineMsForCaller(opts.caller),
+      opts.deadlineMs ?? Number.POSITIVE_INFINITY,
+    );
+    const { signal, deadline } = withLLMDeadline(opts.signal, deadlineMs);
+    let result: GenerateResult;
+    try {
+      result = await this.dispatch({ ...opts, signal });
+    } catch (err) {
+      // Relabel to TimeoutError only when OUR per-call timer fired AND the error
+      // is abort-shaped: a 5xx/429/network thrown while the timer happens to be
+      // aborted must keep its own class, and an outer caller cancellation that
+      // never tripped our timer is not our deadline.
+      if (deadline.aborted && isAbortError(err, deadline)) throw toTimeoutError(err);
+      throw err;
+    }
     const durationMs = Date.now() - start;
     this.recordGenerate(opts, result, durationMs);
     return result;
@@ -103,6 +123,7 @@ export class LLM {
       stopWhen: opts.stopWhen,
       maxOutputTokens: opts.maxOutputTokens,
       maxRetries: 0,
+      abortSignal: opts.signal,
     };
     const result = opts.prompt !== undefined
       ? await generateText({ ...base, prompt: opts.prompt })
@@ -152,6 +173,51 @@ function priceAiSdkUsage(
     cacheRead: details?.cacheReadTokens ?? 0,
     cacheWrite: details?.cacheWriteTokens ?? 0,
   });
+}
+
+function deadlineMsForCaller(caller: GenerateOpts["caller"]): number {
+  return caller === "chat" ? CHAT_LLM_CALL_DEADLINE_MS : LLM_CALL_DEADLINE_MS;
+}
+
+// Returns BOTH the per-call timer (so the catch can ask "did our timer fire?")
+// and the signal actually handed to the provider — the timer alone when there is
+// no outer signal, else the union of the two.
+function withLLMDeadline(
+  signal: AbortSignal | undefined,
+  deadlineMs: number,
+): { signal: AbortSignal; deadline: AbortSignal } {
+  const deadline = AbortSignal.timeout(deadlineMs);
+  return {
+    deadline,
+    signal: signal === undefined ? deadline : AbortSignal.any([signal, deadline]),
+  };
+}
+
+// True when the caught error is the shape an aborted request produces -- the
+// timer's own reason, or an AbortError/TimeoutError anywhere in its cause chain
+// (some providers wrap the abort under a non-standard name). A 5xx/429/network
+// error carries no such cause and is NOT matched, so it keeps its own retry
+// class. Only consulted when OUR timer fired (deadline.aborted), so widening to
+// the cause chain cannot mislabel an unrelated failure.
+function isAbortError(err: unknown, deadline: AbortSignal): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current != null; depth++) {
+    if (current === deadline.reason) return true;
+    if (typeof current !== "object") return false;
+    const name = (current as { name?: unknown }).name;
+    if (name === "AbortError" || name === "TimeoutError") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function toTimeoutError(err: unknown): Error {
+  if (err instanceof Error && err.name === "TimeoutError") return err;
+  const message = err instanceof Error ? err.message : String(err);
+  const out = new Error(`Request timeout: ${message}`) as Error & { cause?: unknown };
+  out.name = "TimeoutError";
+  if (err instanceof Error) out.cause = err;
+  return out;
 }
 
 // ============================================================================

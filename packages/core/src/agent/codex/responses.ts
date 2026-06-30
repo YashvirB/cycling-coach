@@ -575,12 +575,40 @@ function parseRetryAfterMs(headers: Headers): number | undefined {
   return undefined;
 }
 
+function isTimeoutAbort(signal: AbortSignal | undefined): boolean {
+  if (!signal?.aborted) return false;
+  const reason = signal.reason;
+  if (reason instanceof Error && /timeout|deadline/i.test(`${reason.name} ${reason.message}`)) {
+    return true;
+  }
+  if (reason && typeof reason === "object") {
+    const { name, message } = reason as { name?: unknown; message?: unknown };
+    return /timeout|deadline/i.test(`${String(name ?? "")} ${String(message ?? "")}`);
+  }
+  return false;
+}
+
+function abortError(signal: AbortSignal | undefined, fallback?: unknown): Error {
+  if (isTimeoutAbort(signal)) return new Error("Request was aborted");
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  if (fallback instanceof Error) return fallback;
+  if (reason === undefined) return new Error("Request was aborted");
+  if (typeof reason === "string") return new Error(reason);
+  try {
+    const serialized = JSON.stringify(reason);
+    return new Error(serialized ?? "Request was aborted");
+  } catch {
+    return new Error("Request was aborted");
+  }
+}
+
 // ============================================================================
 // Main entrypoint — one round-trip, no internal retry loop
 // ============================================================================
 
 export async function codexResponses(params: CodexResponsesParams): Promise<CodexResponsesResult> {
-  if (params.signal?.aborted) throw new Error("Request was aborted");
+  if (params.signal?.aborted) throw abortError(params.signal);
 
   const accountId = extractAccountId(params.accessToken);
   const headers = buildSSEHeaders(accountId, params.accessToken, params.sessionId);
@@ -600,7 +628,7 @@ export async function codexResponses(params: CodexResponsesParams): Promise<Code
     // the outer classifier reads the errno via the cause chain. Abort surfaces
     // as the verbatim string the timeout classifier matches.
     if (err instanceof Error && (err.name === "AbortError" || params.signal?.aborted)) {
-      throw new Error("Request was aborted");
+      throw abortError(params.signal, err);
     }
     throw err;
   }
@@ -626,9 +654,17 @@ export async function codexResponses(params: CodexResponsesParams): Promise<Code
 
   if (!response.body) throw new Error("No response body");
 
-  const result = await accumulate(mapCodexEvents(parseSSE(response)));
+  let result: CodexResponsesResult;
+  try {
+    result = await accumulate(mapCodexEvents(parseSSE(response)));
+  } catch (err) {
+    if (err instanceof Error && (err.name === "AbortError" || params.signal?.aborted)) {
+      throw abortError(params.signal, err);
+    }
+    throw err;
+  }
 
-  if (params.signal?.aborted) throw new Error("Request was aborted");
-
+  // A fully-accumulated result is already paid for; return it even if the signal
+  // races the boundary and flips to aborted after accumulation has resolved.
   return result;
 }
